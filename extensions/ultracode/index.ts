@@ -19,7 +19,7 @@ import { Type } from "typebox";
 import { DEPTH_ENV } from "./agent.ts";
 import { keywordNote, type SizeGuideline, sizeText, TOOL_DESCRIPTION, ultracodeSystemPrompt } from "./prompt.ts";
 import { KEYWORD_RE, rainbow, spinner, UltracodeEditor } from "./rainbow.ts";
-import { listRuns, patchRun, type RunRecord, runIdsFromSession, runState } from "./registry.ts";
+import { deleteRun, listRuns, patchRun, type RunRecord, readRun, runIdsFromSession, runState } from "./registry.ts";
 import { type AgentState, parseScript, runsRoot, safeStringify, withMeta, WorkflowRun } from "./runtime.ts";
 
 interface Config {
@@ -498,6 +498,154 @@ export default function ultracode(pi: ExtensionAPI) {
 		},
 	});
 
+	// ── management tool (lets the agent inspect, control and clean up runs) ──
+
+	const MANAGE_ACTIONS = ["list", "status", "pause", "resume", "stop", "dismiss", "delete", "delete_saved"] as const;
+	type ManageAction = (typeof MANAGE_ACTIONS)[number];
+	const liveIds = () => new Set(runs.filter((r) => r.running).map((r) => r.id));
+	const truncate = (text: string, max: number) => (text.length > max ? `${text.slice(0, max)}\n… [truncated]` : text);
+
+	function describeLive(run: WorkflowRun): string {
+		const c = run.counts();
+		const lines = [
+			`${run.id} (${run.meta.name}) — ${run.status}${run.currentPhase ? ` · phase: ${run.currentPhase}` : ""}`,
+			`agents: ${c.done} done, ${c.running} running, ${c.failed} failed, ${c.total} started · ${fmtDuration((run.endedAt ?? Date.now()) - run.startedAt)} · ↑${fmtTokens(run.usage.input)} ↓${fmtTokens(run.usage.output)}`,
+			`script: ${run.scriptPath}`,
+		];
+		if (run.agents.length) lines.push("", "Agents:", ...run.agents.slice(-60).map((a) => `  #${a.index} ${agentLine(a)}${a.error ? ` — ${a.error.slice(0, 200)}` : ""}`));
+		if (run.logs.length) lines.push("", "Log (last 10):", ...run.logs.slice(-10).map((l) => `  ${l}`));
+		if (!run.running) lines.push("", truncate(formatResult(run), 20_000));
+		return lines.join("\n");
+	}
+
+	function describeRecord(r: RunRecord, state: string): string {
+		const lines = [
+			`${r.id} (${r.name}) — ${state === "interrupted" ? "INTERRUPTED (not running; resume with workflow { resume })" : state === "elsewhere" ? `running in another pi process (pid ${r.pid})` : r.status}`,
+			`agents: ${r.done}/${r.total} finished · started ${new Date(r.startedAt).toISOString()}`,
+			`script: ${path.join(runsRoot(), r.id, "script.js")}`,
+		];
+		const resultFile = path.join(runsRoot(), r.id, "result.json");
+		if (fs.existsSync(resultFile)) lines.push(`result: ${resultFile}`, "", truncate(fs.readFileSync(resultFile, "utf8"), 20_000));
+		return lines.join("\n");
+	}
+
+	async function confirmDelete(ctx: ExtensionContext, title: string, message: string): Promise<boolean> {
+		// Deleting is irreversible, so the user confirms when there is someone to ask.
+		return !ctx.hasUI || (await ctx.ui.confirm(title, message));
+	}
+
+	pi.registerTool({
+		name: "workflow_manage",
+		label: "Workflow manage",
+		description:
+			"Inspect and manage dynamic workflow runs and saved workflows. Actions: " +
+			"list (runs in this pi, this session's interrupted runs, recent runs on disk, saved workflows); " +
+			"status {id} (progress, agents, log, result); pause/resume/stop {id} (runs executing in this pi); " +
+			"dismiss {id} (hide an interrupted run); delete {id} (permanently remove a finished/stopped/interrupted run's files — asks the user); " +
+			"delete_saved {name} (remove a saved workflow command — asks the user). " +
+			"To relaunch an interrupted or stopped run, use the workflow tool with { resume: id }, not this tool. " +
+			"Don't poll status in a loop: a running workflow's result arrives by itself as a follow-up message.",
+		promptSnippet: "workflow_manage: list, inspect, pause/resume/stop, dismiss and delete workflow runs and saved workflows",
+		parameters: Type.Object({
+			action: Type.Unsafe<ManageAction>({ type: "string", enum: [...MANAGE_ACTIONS], description: "What to do" }),
+			id: Type.Optional(Type.String({ description: "Run id (for status, pause, resume, stop, dismiss, delete)" })),
+			name: Type.Optional(Type.String({ description: "Saved workflow name (for delete_saved)" })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			ctxRef = ctx;
+			refreshDetached(ctx);
+			const text = (t: string) => ({ content: [{ type: "text" as const, text: t }], details: { action: params.action } });
+			const live = params.id ? runs.find((r) => r.id === params.id) : undefined;
+			const needId = () => {
+				if (!params.id) throw new Error(`action "${params.action}" needs an id`);
+				return params.id;
+			};
+
+			switch (params.action) {
+				case "list": {
+					const lines: string[] = [];
+					const mine = [...runs].reverse();
+					lines.push(`Runs in this pi process (${mine.length}):`, ...(mine.length ? mine.map((r) => `  ${runLine(r)} · ${r.id}`) : ["  (none)"]));
+					lines.push(
+						"",
+						`This session's runs not executing here (${detached.length}):`,
+						...(detached.length
+							? detached.map((d) => `  ${d.state === "elsewhere" ? `● in pi pid ${d.run.pid}` : "⚠ interrupted"} · ${d.run.name} · ${d.run.done}/${d.run.total} agents · ${d.run.id}`)
+							: ["  (none)"]),
+					);
+					const known = new Set([...mine.map((r) => r.id), ...detached.map((d) => d.run.id)]);
+					const others = listRuns().filter((r) => !known.has(r.id)).slice(0, 15);
+					lines.push("", `Other recent runs on disk (${others.length} shown):`, ...(others.length ? others.map((r) => `  ${runState(r, liveIds())} · ${r.status} · ${r.name} · ${r.done}/${r.total} agents · ${r.id}`) : ["  (none)"]));
+					const saved = [...discoverSaved(ctx.cwd).values()];
+					lines.push("", `Saved workflows (${saved.length}):`, ...(saved.length ? saved.map((w) => `  /${w.name} (${w.scope}) ${w.file}`) : ["  (none)"]));
+					return text(lines.join("\n"));
+				}
+				case "status": {
+					const id = needId();
+					if (live) return text(describeLive(live));
+					const rec = readRun(id);
+					if (!rec) throw new Error(`no workflow run "${id}"`);
+					return text(describeRecord(rec, runState(rec, liveIds())));
+				}
+				case "pause":
+				case "resume":
+				case "stop": {
+					const id = needId();
+					if (!live || !live.running) {
+						const rec = readRun(id);
+						const state = rec ? runState(rec, liveIds()) : undefined;
+						if (!rec) throw new Error(`no workflow run "${id}"`);
+						if (state === "elsewhere") throw new Error(`run ${id} is executing in another pi process (pid ${rec.pid}); control it from there`);
+						if (params.action === "resume" && state === "interrupted") {
+							throw new Error(`run ${id} is interrupted, not paused. Relaunch it with the workflow tool: { resume: "${id}" }`);
+						}
+						throw new Error(`run ${id} is not executing in this pi (status: ${rec.status})`);
+					}
+					if (params.action === "pause") live.pause();
+					else if (params.action === "resume") live.resume();
+					else live.stop();
+					refreshUI();
+					return text(`${params.action === "stop" ? "Stopped" : params.action === "pause" ? "Paused" : "Resumed"} ${id}. Status: ${live.status}.`);
+				}
+				case "dismiss": {
+					const id = needId();
+					if (!readRun(id)) throw new Error(`no workflow run "${id}"`);
+					patchRun(id, { dismissed: true });
+					refreshDetached(ctx);
+					refreshUI();
+					return text(`Dismissed ${id}; it no longer shows as interrupted. Its files are kept.`);
+				}
+				case "delete": {
+					const id = needId();
+					const rec = readRun(id);
+					if (!rec) throw new Error(`no workflow run "${id}"`);
+					if (!(await confirmDelete(ctx, "Delete workflow run?", `Permanently delete ${rec.name} (${id}): script, journal, results and agent sessions? It can't be resumed afterwards.`))) {
+						throw new Error("The user declined to delete this run.");
+					}
+					const res = deleteRun(id, liveIds());
+					if (!res.ok) throw new Error(res.error);
+					const i = runs.findIndex((r) => r.id === id);
+					if (i >= 0) runs.splice(i, 1);
+					refreshDetached(ctx);
+					refreshUI();
+					return text(`Deleted workflow run ${id}.`);
+				}
+				case "delete_saved": {
+					if (!params.name) throw new Error('action "delete_saved" needs a name');
+					const saved = discoverSaved(ctx.cwd).get(params.name);
+					if (!saved) throw new Error(`no saved workflow "${params.name}"`);
+					if (!(await confirmDelete(ctx, "Delete saved workflow?", `Delete /${saved.name} (${saved.file})?`))) {
+						throw new Error("The user declined to delete this saved workflow.");
+					}
+					fs.rmSync(saved.file);
+					return text(`Deleted saved workflow /${saved.name} (${saved.file}). The command disappears after /reload.`);
+				}
+				default:
+					throw new Error(`unknown action "${params.action}"`);
+			}
+		},
+	});
+
 	pi.registerMessageRenderer(RESULT_TYPE, (message, { expanded }, theme) => {
 		const d = (message.details ?? {}) as any;
 		const status = String(d.status ?? "done");
@@ -550,12 +698,18 @@ export default function ultracode(pi: ExtensionAPI) {
 					(d) =>
 						`${d.state === "elsewhere" ? "● in another pi" : "⚠ interrupted"} · ${d.run.name} · ${d.run.done}/${d.run.total} agents done · ${d.run.id}`,
 				);
-				if (!labels.length && !detachedLabels.length) {
+				const saved = [...discoverSaved(ctx.cwd).values()];
+				const savedLabel = saved.length ? `Saved workflows (${saved.length}) …` : undefined;
+				if (!labels.length && !detachedLabels.length && !savedLabel) {
 					ctx.ui.notify("No workflow runs in this session yet.", "info");
 					return;
 				}
-				const pick = await ctx.ui.select("Workflows", [...labels, ...detachedLabels]);
+				const pick = await ctx.ui.select("Workflows", [...labels, ...detachedLabels, ...(savedLabel ? [savedLabel] : [])]);
 				if (!pick) return;
+				if (pick === savedLabel) {
+					await savedMenu(ctx);
+					continue;
+				}
 				const i = labels.indexOf(pick);
 				if (i >= 0) await runMenu(list[i]!, ctx);
 				else await detachedMenu(detached[detachedLabels.indexOf(pick)]!, ctx);
@@ -563,11 +717,28 @@ export default function ultracode(pi: ExtensionAPI) {
 		},
 	});
 
+	async function savedMenu(ctx: ExtensionContext): Promise<void> {
+		while (true) {
+			const saved = [...discoverSaved(ctx.cwd).values()];
+			if (!saved.length) return;
+			const labels = saved.map((w) => `/${w.name} · ${w.scope}${w.description ? ` · ${w.description}` : ""}`);
+			const pick = await ctx.ui.select("Saved workflows", [...labels, "Back"]);
+			if (!pick || pick === "Back") return;
+			const w = saved[labels.indexOf(pick)]!;
+			const act = await ctx.ui.select(`/${w.name} — ${w.file}`, ["View script", "Delete", "Back"]);
+			if (act === "View script") await ctx.ui.editor(`${w.file} (edits here are not saved)`, fs.readFileSync(w.file, "utf8"));
+			else if (act === "Delete" && (await ctx.ui.confirm("Delete saved workflow?", `Delete /${w.name} (${w.file})?`))) {
+				fs.rmSync(w.file);
+				ctx.ui.notify(`Deleted /${w.name}; the command disappears after /reload`, "info");
+			}
+		}
+	}
+
 	async function detachedMenu(d: { run: RunRecord; state: "interrupted" | "elsewhere" }, ctx: ExtensionContext): Promise<void> {
 		const r = d.run;
 		const actions =
 			d.state === "interrupted"
-				? [`Resume (reuses the ${r.done} finished agents)`, "View script", "Dismiss", "Back"]
+				? [`Resume (reuses the ${r.done} finished agents)`, "View script", "Dismiss", "Delete", "Back"]
 				: ["View script", "Back"];
 		const title =
 			d.state === "interrupted"
@@ -580,6 +751,12 @@ export default function ultracode(pi: ExtensionAPI) {
 			await ctx.ui.editor(`Script — ${r.id} (edits here are not saved)`, fs.readFileSync(path.join(runsRoot(), r.id, "script.js"), "utf8"));
 		} else if (choice === "Dismiss") {
 			patchRun(r.id, { dismissed: true });
+			refreshDetached(ctx);
+			refreshUI();
+		} else if (choice === "Delete") {
+			if (!(await ctx.ui.confirm("Delete workflow run?", `Permanently delete ${r.name} (${r.id})? It can't be resumed afterwards.`))) return;
+			const res = deleteRun(r.id, new Set(runs.filter((x) => x.running).map((x) => x.id)));
+			ctx.ui.notify(res.ok ? `Deleted ${r.id}` : res.error, res.ok ? "info" : "error");
 			refreshDetached(ctx);
 			refreshUI();
 		}
@@ -595,6 +772,7 @@ export default function ultracode(pi: ExtensionAPI) {
 				"View script",
 				"Save as command",
 				!run.running ? "View result" : undefined,
+				!run.running ? "Delete run" : undefined,
 				"Back",
 			].filter((x): x is string => !!x);
 			const choice = await ctx.ui.select(runLine(run), actions);
@@ -608,6 +786,16 @@ export default function ultracode(pi: ExtensionAPI) {
 			} else if (choice === "View script") await ctx.ui.editor(`Script — ${run.scriptPath} (edits here are not saved)`, run.source);
 			else if (choice === "View result") await ctx.ui.editor(`Result — ${run.meta.name}`, formatResult(run));
 			else if (choice === "Save as command") await saveRun(run, ctx);
+			else if (choice === "Delete run") {
+				if (!(await ctx.ui.confirm("Delete workflow run?", `Permanently delete ${run.meta.name} (${run.id})? It can't be resumed afterwards.`))) continue;
+				const res = deleteRun(run.id, new Set(runs.filter((r) => r.running).map((r) => r.id)));
+				if (!res.ok) ctx.ui.notify(res.error, "error");
+				else {
+					runs.splice(runs.indexOf(run), 1);
+					ctx.ui.notify(`Deleted ${run.id}`, "info");
+					return;
+				}
+			}
 		}
 	}
 

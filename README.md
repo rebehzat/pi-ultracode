@@ -22,7 +22,8 @@ pi install git:github.com/rebehzat/pi-ultracode
 | `/ultracode [on\|off\|status]` | Ultracode mode: `xhigh` thinking + the model plans a workflow for every substantive task. An animated `⚡ultracode` badge appears on the editor border. `pi --ultracode` starts with it on. |
 | `workflow` tool | What the model calls. Takes `script` (or `script_path`, or `name` of a saved workflow), optional `args`, and `resume` (a run id). |
 | Live widget | Spinner, phase, agent counts, elapsed time and tokens for each running workflow, above the editor. |
-| `/workflows` | Browse runs → phases/agents (prompt, tool calls, result), log, pause/resume, stop, stop/restart one agent, view script/result, **save as a command**. |
+| `/workflows` | Browse runs → phases/agents (prompt, tool calls, result), log, pause/resume, stop, stop/restart one agent, view script/result, **save as a command**, **delete** finished or interrupted runs. Saved workflows are listed at the bottom (view/delete). |
+| `workflow_manage` tool | Lets the agent `list` runs and saved workflows, get a run's `status`, `pause`/`resume`/`stop` runs executing in this pi, `dismiss` interrupted runs, and `delete` runs or saved workflows. Deleting always asks you first. |
 | Saved workflows | Saved to `.pi/workflows/` (project, nearest dir wins) or `~/.pi/agent/workflows/` (personal), and run as `/<name> [args]`. JSON args go straight to the script; free-form text is passed to the model to turn into structured args. |
 
 ## Script API

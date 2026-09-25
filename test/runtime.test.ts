@@ -123,6 +123,18 @@ assert.equal(s.status, "stopped");
 	]);
 	assert.deepEqual([...ids], ["legacy-abc123"]);
 	assert.ok(listRuns().some((x) => x.id === "legacy-abc123"));
+
+	// Deleting runs: guarded ids, never a live run, never one running in another process.
+	const { deleteRun } = await import("../extensions/ultracode/registry.ts");
+	assert.equal(deleteRun("../etc", new Set()).ok, false);
+	assert.equal(deleteRun("nope-000000", new Set()).ok, false);
+	assert.equal(deleteRun(quit.id, new Set([quit.id])).ok, false, "live run refused");
+	patchRun("legacy-abc123", { pid: process.ppid });
+	assert.equal(deleteRun("legacy-abc123", new Set()).ok, false, "run owned by another live pi refused");
+	patchRun("legacy-abc123", { status: "interrupted", pid: 2 ** 22 + 12345 });
+	assert.deepEqual(deleteRun("legacy-abc123", new Set()), { ok: true });
+	assert.equal(readRun("legacy-abc123"), undefined);
+	assert.ok(fs.existsSync(runsRoot()), "runs root itself untouched");
 }
 
 console.log("ok");

@@ -136,3 +136,15 @@ export function interruptedForSession(sessionId: string | undefined, sessionRunI
 			runState(r, liveIds) === "interrupted",
 	);
 }
+
+/** Remove a run directory (script, journal, results, agent sessions). Refuses ids that don't name a run. */
+export function deleteRun(id: string, liveIds: Set<string>): { ok: true } | { ok: false; error: string } {
+	if (!/^[\w.-]+$/.test(id) || id === "." || id === "..") return { ok: false, error: `invalid run id "${id}"` };
+	const dir = path.join(runsRoot(), id);
+	if (path.dirname(dir) !== runsRoot() || !fs.existsSync(path.join(dir, "script.js"))) return { ok: false, error: `no workflow run "${id}"` };
+	if (liveIds.has(id)) return { ok: false, error: `run ${id} is still running in this pi; stop it first` };
+	const rec = readRun(id);
+	if (rec && runState(rec, liveIds) === "elsewhere") return { ok: false, error: `run ${id} is running in another pi process (pid ${rec.pid})` };
+	fs.rmSync(dir, { recursive: true, force: true });
+	return { ok: true };
+}
