@@ -65,7 +65,6 @@ Optional `~/.pi/agent/ultracode.json`:
   "ultracode": false,
   "keywordTrigger": true,
   "sizeGuideline": "medium",
-  "askBeforeRun": true,
   "rainbowEditor": true,
   "maxConcurrentAgents": 16,
   "maxStructuredRetries": 5,

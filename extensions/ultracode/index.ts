@@ -18,6 +18,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { DEPTH_ENV } from "./agent.ts";
 import { keywordNote, type SizeGuideline, sizeText, TOOL_DESCRIPTION, ultracodeSystemPrompt } from "./prompt.ts";
+import { normalizeArgs, sanitizeContext } from "./args.ts";
 import { KEYWORD_RE, rainbow, spinner, UltracodeEditor } from "./rainbow.ts";
 import { deleteRun, listRuns, patchRun, type RunRecord, readRun, runIdsFromSession, runState } from "./registry.ts";
 import { type AgentState, parseScript, runsRoot, safeStringify, withMeta, WorkflowRun } from "./runtime.ts";
@@ -30,8 +31,6 @@ interface Config {
 	sizeGuideline?: SizeGuideline;
 	maxConcurrentAgents?: number;
 	maxStructuredRetries?: number;
-	/** Ask before each run (skipped while ultracode is on). Default true. */
-	askBeforeRun?: boolean;
 	/** Replace the input editor with one that rainbow-highlights the keyword. Default true. */
 	rainbowEditor?: boolean;
 	/** Thinking level for workflow agents. Default: the session's current level. */
@@ -210,8 +209,6 @@ export default function ultracode(pi: ExtensionAPI) {
 	let modeOn = false;
 	let previousThinking: string | undefined;
 	let turnIsUltracode = false;
-	let allowAllThisSession = false;
-	const allowedNames = new Set<string>();
 	let editor: UltracodeEditor | undefined;
 	let frame = 0;
 	/** This session's runs that this process isn't executing: interrupted, or owned by another pi process. */
@@ -236,8 +233,7 @@ export default function ultracode(pi: ExtensionAPI) {
 
 	async function resumeDetached(id: string, ctx: ExtensionContext): Promise<void> {
 		const dir = path.join(runsRoot(), id);
-		const source = await approve(ctx, fs.readFileSync(path.join(dir, "script.js"), "utf8"));
-		if (!source) return;
+		const source = fs.readFileSync(path.join(dir, "script.js"), "utf8");
 		let args: unknown;
 		try {
 			args = JSON.parse(fs.readFileSync(path.join(dir, "args.json"), "utf8")) ?? undefined;
@@ -353,44 +349,6 @@ export default function ultracode(pi: ExtensionAPI) {
 		};
 	}
 
-	async function approve(ctx: ExtensionContext, source: string, savedName?: string): Promise<string | undefined> {
-		if (!ctx.hasUI || config.askBeforeRun === false || modeOn || allowAllThisSession) return source;
-		if (savedName && allowedNames.has(savedName)) return source;
-		while (true) {
-			const { meta } = parseScript(source);
-			const phases = meta.phases?.length ? ` · phases: ${meta.phases.join(" → ")}` : "";
-			const options = [
-				"Yes, run it",
-				savedName ? `Yes, and don't ask again for ${savedName} this session` : "Yes, and don't ask again this session",
-				"View / edit script",
-				"No",
-			];
-			const choice = await ctx.ui.select(
-				`Run workflow "${meta.name}"?${meta.description ? ` — ${meta.description}` : ""}${phases} (spawns background agents; uses more tokens)`,
-				options,
-			);
-			if (choice === options[0]) return source;
-			if (choice === options[1]) {
-				if (savedName) allowedNames.add(savedName);
-				else allowAllThisSession = true;
-				return source;
-			}
-			if (choice === options[2]) {
-				const edited = await ctx.ui.editor(`Workflow script: ${meta.name}`, source);
-				if (edited?.trim()) {
-					try {
-						parseScript(edited);
-						source = edited;
-					} catch (e) {
-						ctx.ui.notify(`Edited script is invalid: ${(e as Error).message}`, "error");
-					}
-				}
-				continue;
-			}
-			return undefined;
-		}
-	}
-
 	function launch(
 		ctx: ExtensionContext,
 		source: string,
@@ -435,7 +393,12 @@ export default function ultracode(pi: ExtensionAPI) {
 			script: Type.Optional(Type.String({ description: "Full workflow script source, starting with `export const meta = {...}`." })),
 			script_path: Type.Optional(Type.String({ description: "Path to a workflow .js file (alternative to script)." })),
 			name: Type.Optional(Type.String({ description: "Name of a saved workflow to run." })),
-			args: Type.Optional(Type.Unknown({ description: "JSON value exposed to the script as the global `args`." })),
+			args: Type.Optional(
+				Type.Record(Type.String(), Type.Unknown(), {
+					description:
+						"Object exposed to the script as the global `args`. Keep it flat: plain arrays of strings or objects, never wrapped in {\"item\": ...}. For large inputs, write the data into the script instead.",
+				}),
+			),
 			resume: Type.Optional(
 				Type.String({ description: "Run id to relaunch; finished agents with identical prompts return their saved results." }),
 			),
@@ -460,11 +423,8 @@ export default function ultracode(pi: ExtensionAPI) {
 			if (!source) throw new Error("Provide one of: script, script_path, name, resume.");
 			parseScript(source); // fail fast on syntax-level problems
 
-			const approved = await approve(ctx, source, params.name);
-			if (!approved) throw new Error("The user declined to run this workflow. Ask what they would like to change.");
-
 			const background = ctx.mode === "tui" || ctx.mode === "rpc";
-			const { run, done } = launch(ctx, approved, params.args, { resume: params.resume, background });
+			const { run, done } = launch(ctx, source, normalizeArgs(params.args), { resume: params.resume, background });
 			if (params.resume) {
 				patchRun(params.resume, { resumedBy: run.id });
 				refreshDetached(ctx);
@@ -770,7 +730,7 @@ export default function ultracode(pi: ExtensionAPI) {
 			else if (choice === "Pause") run.pause();
 			else if (choice === "Resume") run.resume();
 			else if (choice === "Stop run") {
-				if (await ctx.ui.confirm("Stop workflow?", `Stop ${run.meta.name}? Finished agents are kept for a relaunch.`)) run.stop();
+				run.stop();
 			} else if (choice === "View script") await ctx.ui.editor(`Script — ${run.scriptPath} (edits here are not saved)`, run.source);
 			else if (choice === "View result") await ctx.ui.editor(`Result — ${run.meta.name}`, formatResult(run));
 			else if (choice === "Save as command") await saveRun(run, ctx);
@@ -829,7 +789,6 @@ export default function ultracode(pi: ExtensionAPI) {
 				}
 			} catch {}
 		}
-		if (fs.existsSync(file) && !(await ctx.ui.confirm("Overwrite?", `${file} exists. Overwrite it?`))) return;
 		fs.mkdirSync(dir, { recursive: true });
 		const source = name === run.meta.name ? run.source : withMeta(run.source, { ...run.meta, name });
 		fs.writeFileSync(file, source);
@@ -862,8 +821,7 @@ export default function ultracode(pi: ExtensionAPI) {
 						return;
 					}
 				}
-				const source = await approve(ctx, fs.readFileSync(saved.file, "utf8"), w.name);
-				if (!source) return;
+				const source = fs.readFileSync(saved.file, "utf8");
 				launch(ctx, source, args, { background: ctx.mode === "tui" || ctx.mode === "rpc" });
 				ctx.ui.notify(`Started workflow ${w.name} — /workflows to watch`, "info");
 			},
@@ -874,11 +832,15 @@ export default function ultracode(pi: ExtensionAPI) {
 
 	// ── events ──
 
+	// A deeply nested tool call in the history makes some providers reject every later request.
+	pi.on("context", (event) => {
+		const messages = sanitizeContext(event.messages);
+		return messages ? { messages } : undefined;
+	});
+
 	pi.on("session_start", (event, ctx) => {
 		ctxRef = ctx;
 		config = loadConfig();
-		allowAllThisSession = false;
-		allowedNames.clear();
 		if (ctx.mode === "tui" && config.rainbowEditor !== false && config.keywordTrigger !== false) {
 			ctx.ui.setEditorComponent((tui, theme, kb) => {
 				editor = new UltracodeEditor(tui, theme, kb);

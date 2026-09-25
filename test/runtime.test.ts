@@ -137,4 +137,27 @@ assert.equal(s.status, "stopped");
 	assert.ok(fs.existsSync(runsRoot()), "runs root itself untouched");
 }
 
+// Malformed workflow args: chained {"item": [...]} wrappers and JSON-encoded strings.
+{
+	const { normalizeArgs, sanitizeContext, depth, MAX_ARG_DEPTH } = await import("../extensions/ultracode/args.ts");
+	const items = Array.from({ length: 40 }, (_, i) => ({ name: `e${i}` }));
+	// Each wrapper holds the next item plus another wrapper, one level deeper per item.
+	let chained: any = { item: [items[39]] };
+	for (let i = 38; i >= 0; i--) chained = { item: [items[i], chained] };
+	const raw = { implement: { item: chained }, audit: { item: { item: ["a", "b"] } }, flat: ["x"], n: 3 };
+	assert.ok(depth(raw) > 40);
+	assert.deepEqual(normalizeArgs(raw), { implement: items, audit: ["a", "b"], flat: ["x"], n: 3 });
+	assert.deepEqual(normalizeArgs(JSON.stringify(JSON.stringify({ a: [1] }))), { a: [1] });
+	assert.deepEqual(normalizeArgs({ items: [1], text: "not json {" }), { items: [1], text: "not json {" }, "other keys untouched");
+
+	const call = { type: "toolCall", id: "c1", name: "workflow", arguments: { script_path: "x.js", args: raw } };
+	const messages: any[] = [{ role: "user", content: "hi" }, { role: "assistant", content: [{ type: "text", text: "ok" }, call] }];
+	const out = sanitizeContext(messages)!;
+	assert.ok(out, "deep tool call clipped");
+	assert.ok(depth(out[1].content[1].arguments) <= MAX_ARG_DEPTH);
+	assert.equal(out[1].content[1].arguments.script_path, "x.js");
+	assert.equal(messages[1].content[1], call, "original messages not mutated");
+	assert.equal(sanitizeContext([{ role: "assistant", content: [{ type: "toolCall", arguments: { a: [1] } }] }]), undefined);
+}
+
 console.log("ok");
