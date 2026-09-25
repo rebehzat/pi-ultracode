@@ -81,4 +81,48 @@ s.stop();
 await p;
 assert.equal(s.status, "stopped");
 
+// run.json ownership + interrupted runs
+{
+	const { listRuns, readRun, runState, runIdsFromSession, patchRun } = await import("../extensions/ultracode/registry.ts");
+	const withSession = { ...defaults, sessionId: "sess-1" };
+	const slow2 = "export const meta = { name: 'long' }\nreturn await agent('SLOW 3')";
+	const quit = new WorkflowRun(slow2, parseScript(slow2), { q: 1 }, withSession);
+	const qp = quit.start();
+	await new Promise((res) => setTimeout(res, 50));
+	quit.stop("shutdown");
+	await qp;
+	assert.equal(quit.status, "interrupted", "quitting pi interrupts rather than stops");
+	const rec = readRun(quit.id)!;
+	assert.equal(rec.sessionId, "sess-1");
+	assert.equal(rec.pid, process.pid);
+	assert.equal(runState(rec, new Set()), "interrupted");
+	assert.equal(runState(rec, new Set([quit.id])), "live");
+
+	// Legacy run dir (no run.json, no result.json): interrupted.
+	const legacy = path.join(runsRoot(), "legacy-abc123");
+	fs.mkdirSync(path.join(legacy, "agents", "0"), { recursive: true });
+	fs.writeFileSync(path.join(legacy, "script.js"), "return 1");
+	fs.writeFileSync(path.join(legacy, "journal.jsonl"), '{"key":"k"}\n');
+	const lr = readRun("legacy-abc123")!;
+	assert.deepEqual([lr.status, lr.done, lr.total, runState(lr, new Set())], ["running", 1, 1, "interrupted"]);
+
+	// Owned by another live process → elsewhere; dead pid → interrupted.
+	patchRun("legacy-abc123", { status: "running", pid: process.ppid });
+	assert.equal(runState(readRun("legacy-abc123")!, new Set()), "elsewhere");
+	patchRun("legacy-abc123", { pid: 2 ** 22 + 12345 });
+	assert.equal(runState(readRun("legacy-abc123")!, new Set()), "interrupted");
+
+	// Finished runs are finished; user-stopped runs are not "interrupted".
+	assert.equal(runState(readRun(r.id)!, new Set()), "finished");
+	assert.equal(runState(readRun(s.id)!, new Set()), "finished");
+
+	// Session attribution for runs without a session id.
+	const ids = runIdsFromSession([
+		{ type: "message", message: { role: "toolResult", toolName: "workflow", details: { runId: "legacy-abc123" } } },
+		{ type: "message", message: { role: "toolResult", toolName: "bash", details: {} } },
+	]);
+	assert.deepEqual([...ids], ["legacy-abc123"]);
+	assert.ok(listRuns().some((x) => x.id === "legacy-abc123"));
+}
+
 console.log("ok");

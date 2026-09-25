@@ -19,6 +19,7 @@ import { Type } from "typebox";
 import { DEPTH_ENV } from "./agent.ts";
 import { keywordNote, type SizeGuideline, sizeText, TOOL_DESCRIPTION, ultracodeSystemPrompt } from "./prompt.ts";
 import { KEYWORD_RE, rainbow, spinner, UltracodeEditor } from "./rainbow.ts";
+import { listRuns, patchRun, type RunRecord, runIdsFromSession, runState } from "./registry.ts";
 import { type AgentState, parseScript, runsRoot, safeStringify, withMeta, WorkflowRun } from "./runtime.ts";
 
 interface Config {
@@ -133,6 +134,7 @@ const STATUS_ICON: Record<string, string> = {
 	done: "✓",
 	failed: "✗",
 	stopped: "■",
+	interrupted: "⚠",
 	queued: "○",
 	cached: "↺",
 };
@@ -190,7 +192,7 @@ function formatResult(run: WorkflowRun): string {
 			body = `${body.slice(0, MAX_RESULT_CHARS)}\n… [truncated ${body.length - MAX_RESULT_CHARS} chars — read the full result file]`;
 		}
 		lines.push("", "<workflow-result>", body, "</workflow-result>");
-	} else if (run.status === "stopped") {
+	} else if (run.status === "stopped" || run.status === "interrupted") {
 		lines.push("", `The run was stopped. Relaunch with workflow { resume: "${run.id}" } to reuse finished agents.`);
 	}
 	return lines.join("\n");
@@ -212,6 +214,40 @@ export default function ultracode(pi: ExtensionAPI) {
 	const allowedNames = new Set<string>();
 	let editor: UltracodeEditor | undefined;
 	let frame = 0;
+	/** This session's runs that this process isn't executing: interrupted, or owned by another pi process. */
+	let detached: { run: RunRecord; state: "interrupted" | "elsewhere" }[] = [];
+
+	function refreshDetached(ctx: ExtensionContext): void {
+		let sessionId: string | undefined;
+		let sessionRunIds = new Set<string>();
+		try {
+			sessionId = ctx.sessionManager.getSessionId();
+			sessionRunIds = runIdsFromSession(ctx.sessionManager.getBranch() as any[]);
+		} catch {}
+		const liveIds = new Set(runs.filter((r) => r.running).map((r) => r.id));
+		detached = [];
+		for (const r of listRuns()) {
+			if (r.resumedBy || r.dismissed) continue;
+			if (!(r.sessionId ? r.sessionId === sessionId : sessionRunIds.has(r.id))) continue;
+			const state = runState(r, liveIds);
+			if (state === "interrupted" || state === "elsewhere") detached.push({ run: r, state });
+		}
+	}
+
+	async function resumeDetached(id: string, ctx: ExtensionContext): Promise<void> {
+		const dir = path.join(runsRoot(), id);
+		const source = await approve(ctx, fs.readFileSync(path.join(dir, "script.js"), "utf8"));
+		if (!source) return;
+		let args: unknown;
+		try {
+			args = JSON.parse(fs.readFileSync(path.join(dir, "args.json"), "utf8")) ?? undefined;
+		} catch {}
+		const { run } = launch(ctx, source, args, { resume: id, background: ctx.mode === "tui" || ctx.mode === "rpc" });
+		patchRun(id, { resumedBy: run.id });
+		refreshDetached(ctx);
+		refreshUI();
+		ctx.ui.notify(`Resumed ${run.meta.name} as ${run.id}; finished agents are reused`, "info");
+	}
 	let ticker: ReturnType<typeof setInterval> | undefined;
 	const registeredSaved = new Set<string>();
 
@@ -228,7 +264,7 @@ export default function ultracode(pi: ExtensionAPI) {
 		if (turnIsUltracode || modeOn) ctx.ui.setWorkingMessage(rainbow("Ultracoding…", frame));
 
 		const active = runs.filter((r) => r.running);
-		if (!active.length) {
+		if (!active.length && !detached.length) {
 			ctx.ui.setWidget("ultracode", undefined);
 			return;
 		}
@@ -245,7 +281,20 @@ export default function ultracode(pi: ExtensionAPI) {
 			].filter(Boolean);
 			return `${icon} ${rainbow(r.meta.name, frame)} ${theme.fg("muted", `· ${bits.join(" · ")}`)}`;
 		});
-		lines.push(theme.fg("dim", "  /workflows to inspect · pause · stop"));
+		// Runs of this session that this pi process isn't executing (it was restarted, or another pi owns them).
+		for (const d of detached) {
+			lines.push(
+				d.state === "elsewhere"
+					? `${theme.fg("accent", "●")} ${d.run.name} ${theme.fg("muted", `· running in another pi process (pid ${d.run.pid}) · ${d.run.done}/${d.run.total} agents done`)}`
+					: `${theme.fg("warning", "⚠")} ${d.run.name} ${theme.fg("muted", `· interrupted, not running · ${d.run.done}/${d.run.total} agents done`)}`,
+			);
+		}
+		lines.push(
+			theme.fg(
+				"dim",
+				detached.some((d) => d.state === "interrupted") ? "  /workflows to inspect · resume · stop" : "  /workflows to inspect · pause · stop",
+			),
+		);
 		ctx.ui.setWidget("ultracode", lines);
 	}
 
@@ -287,8 +336,13 @@ export default function ultracode(pi: ExtensionAPI) {
 
 	function defaults(ctx: ExtensionContext) {
 		const envMax = Number(process.env.PI_WORKFLOW_MAX_CONCURRENT_AGENTS);
+		let sessionId: string | undefined;
+		try {
+			sessionId = ctx.sessionManager.getSessionId();
+		} catch {}
 		return {
 			cwd: ctx.cwd,
+			sessionId,
 			model: config.agentModel ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
 			thinking: config.agentThinking ?? pi.getThinkingLevel(),
 			maxConcurrent: Math.max(
@@ -411,6 +465,10 @@ export default function ultracode(pi: ExtensionAPI) {
 
 			const background = ctx.mode === "tui" || ctx.mode === "rpc";
 			const { run, done } = launch(ctx, approved, params.args, { resume: params.resume, background });
+			if (params.resume) {
+				patchRun(params.resume, { resumedBy: run.id });
+				refreshDetached(ctx);
+			}
 			const details = { runId: run.id, name: run.meta.name, scriptPath: run.scriptPath, background };
 			if (!background) {
 				await done;
@@ -484,19 +542,48 @@ export default function ultracode(pi: ExtensionAPI) {
 		description: "List workflow runs: inspect phases and agents, pause, stop, save as command",
 		handler: async (_arg, ctx) => {
 			ctxRef = ctx;
-			if (!runs.length) {
-				ctx.ui.notify("No workflow runs in this session yet.", "info");
-				return;
-			}
 			while (true) {
+				refreshDetached(ctx);
 				const list = [...runs].reverse();
 				const labels = list.map((r) => `${runLine(r)} · ${r.id}`);
-				const pick = await ctx.ui.select("Workflows", labels);
+				const detachedLabels = detached.map(
+					(d) =>
+						`${d.state === "elsewhere" ? "● in another pi" : "⚠ interrupted"} · ${d.run.name} · ${d.run.done}/${d.run.total} agents done · ${d.run.id}`,
+				);
+				if (!labels.length && !detachedLabels.length) {
+					ctx.ui.notify("No workflow runs in this session yet.", "info");
+					return;
+				}
+				const pick = await ctx.ui.select("Workflows", [...labels, ...detachedLabels]);
 				if (!pick) return;
-				await runMenu(list[labels.indexOf(pick)]!, ctx);
+				const i = labels.indexOf(pick);
+				if (i >= 0) await runMenu(list[i]!, ctx);
+				else await detachedMenu(detached[detachedLabels.indexOf(pick)]!, ctx);
 			}
 		},
 	});
+
+	async function detachedMenu(d: { run: RunRecord; state: "interrupted" | "elsewhere" }, ctx: ExtensionContext): Promise<void> {
+		const r = d.run;
+		const actions =
+			d.state === "interrupted"
+				? [`Resume (reuses the ${r.done} finished agents)`, "View script", "Dismiss", "Back"]
+				: ["View script", "Back"];
+		const title =
+			d.state === "interrupted"
+				? `${r.name} was interrupted when its pi process exited; it is not running`
+				: `${r.name} is running in another pi process (pid ${r.pid}); manage it from there`;
+		const choice = await ctx.ui.select(title, actions);
+		if (!choice || choice === "Back") return;
+		if (choice.startsWith("Resume")) await resumeDetached(r.id, ctx);
+		else if (choice === "View script") {
+			await ctx.ui.editor(`Script — ${r.id} (edits here are not saved)`, fs.readFileSync(path.join(runsRoot(), r.id, "script.js"), "utf8"));
+		} else if (choice === "Dismiss") {
+			patchRun(r.id, { dismissed: true });
+			refreshDetached(ctx);
+			refreshUI();
+		}
+	}
 
 	async function runMenu(run: WorkflowRun, ctx: ExtensionContext): Promise<void> {
 		while (true) {
@@ -639,6 +726,11 @@ export default function ultracode(pi: ExtensionAPI) {
 		modeOn = false;
 		previousThinking = undefined;
 		if (want) setMode(true, ctx, false, restored ? restoredPrevious : undefined);
+		refreshDetached(ctx);
+		const interrupted = detached.filter((d) => d.state === "interrupted").length;
+		if (interrupted && ctx.hasUI) {
+			ctx.ui.notify(`${interrupted} workflow run${interrupted === 1 ? "" : "s"} from this session ${interrupted === 1 ? "was" : "were"} interrupted — /workflows to resume`, "warning");
+		}
 		syncTicker();
 		refreshUI();
 	});
@@ -657,6 +749,7 @@ export default function ultracode(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", (event, ctx) => {
 		ctxRef = ctx;
+		refreshDetached(ctx);
 		const extra: string[] = [];
 		if (modeOn) extra.push(ultracodeSystemPrompt(size()));
 		const saved = [...discoverSaved(ctx.cwd).values()];
@@ -664,6 +757,14 @@ export default function ultracode(pi: ExtensionAPI) {
 			extra.push(
 				`\n# Saved workflows\nRun with the workflow tool ({ name, args }):\n${saved
 					.map((w) => `- ${w.name}${w.description ? `: ${w.description}` : ""}`)
+					.join("\n")}`,
+			);
+		}
+		const interrupted = detached.filter((d) => d.state === "interrupted");
+		if (interrupted.length) {
+			extra.push(
+				`\n# Interrupted workflow runs\nThese runs from this session are NOT running: the pi process that ran them exited before they finished, so no result will arrive. To continue one, call the workflow tool with { resume: "<id>" } (finished agents are reused, the rest run again).\n${interrupted
+					.map((d) => `- ${d.run.id} (${d.run.name}): ${d.run.done}/${d.run.total} agents finished`)
 					.join("\n")}`,
 			);
 		}
@@ -678,7 +779,8 @@ export default function ultracode(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
-		for (const r of runs) if (r.running) r.stop();
+		// Quitting pi interrupts running workflows; they show up as resumable when the session is resumed.
+		for (const r of runs) if (r.running) r.stop("shutdown");
 		if (ticker) clearInterval(ticker);
 		ticker = undefined;
 		editor?.dispose();

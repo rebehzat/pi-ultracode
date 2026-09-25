@@ -16,7 +16,8 @@ export const MAX_AGENTS_PER_RUN = 1000;
 export const MAX_ITEMS_PER_CALL = 4096;
 
 export type AgentStatus = "queued" | "running" | "done" | "cached" | "failed" | "stopped";
-export type RunStatus = "running" | "paused" | "done" | "failed" | "stopped";
+/** "interrupted": stopped because pi exited; resumable, and shown as such when the session is resumed. */
+export type RunStatus = "running" | "paused" | "done" | "failed" | "stopped" | "interrupted";
 
 export interface AgentOptions {
 	label?: string;
@@ -67,6 +68,8 @@ interface JournalEntry {
 
 export interface RunDefaults {
 	cwd: string;
+	/** pi session that launched the run, recorded in run.json so a resumed session can find it again. */
+	sessionId?: string;
 	model?: string;
 	thinking?: string;
 	maxConcurrent: number;
@@ -231,7 +234,9 @@ export class WorkflowRun {
 		fs.writeFileSync(path.join(this.runDir, "args.json"), JSON.stringify(args ?? null, null, 2));
 		this.gate = new Gate(defaults.maxConcurrent);
 		this.controller.signal.addEventListener("abort", () => this.gate.wake());
+		this.resumedFrom = resumeFrom;
 		if (resumeFrom) this.loadJournal(resumeFrom);
+		this.writeState();
 	}
 
 	private loadJournal(runId: string): void {
@@ -253,7 +258,35 @@ export class WorkflowRun {
 		return () => this.listeners.delete(fn);
 	}
 
+	private lastStateWrite = 0;
+	readonly resumedFrom?: string;
+
+	/**
+	 * run.json: who owns this run (pid, session) and its current status. Written synchronously so the
+	 * status on disk is honest even if pi exits right after (a run whose owner died reads as interrupted).
+	 */
+	writeState(): void {
+		this.lastStateWrite = Date.now();
+		const record = {
+			id: this.id,
+			name: this.meta.name,
+			description: this.meta.description,
+			sessionId: this.defaults.sessionId,
+			cwd: this.defaults.cwd,
+			pid: process.pid,
+			status: this.status,
+			startedAt: this.startedAt,
+			endedAt: this.endedAt,
+			agents: this.counts(),
+			resumedFrom: this.resumedFrom,
+		};
+		try {
+			fs.writeFileSync(path.join(this.runDir, "run.json"), `${JSON.stringify(record, null, 2)}\n`);
+		} catch {}
+	}
+
 	private changed(): void {
+		if (Date.now() - this.lastStateWrite > 5000) this.writeState();
 		for (const fn of this.listeners) {
 			try {
 				fn();
@@ -270,6 +303,7 @@ export class WorkflowRun {
 		if (this.status !== "running") return;
 		this.gate.paused = true;
 		this.status = "paused";
+		this.writeState();
 		this.changed();
 	}
 
@@ -277,13 +311,15 @@ export class WorkflowRun {
 		if (this.status !== "paused") return;
 		this.gate.paused = false;
 		this.status = "running";
+		this.writeState();
 		this.gate.wake();
 		this.changed();
 	}
 
-	stop(): void {
+	stop(reason: "user" | "shutdown" = "user"): void {
 		if (this.endedAt) return;
-		this.status = "stopped";
+		this.status = reason === "shutdown" ? "interrupted" : "stopped";
+		this.writeState();
 		this.controller.abort();
 		this.changed();
 	}
@@ -537,15 +573,16 @@ export class WorkflowRun {
 			const script = new vm.Script(wrapped, { filename: this.scriptPath, lineOffset: -1 });
 			const value = await script.runInContext(context);
 			this.result = value === undefined ? null : JSON.parse(safeStringify(value));
-			if (this.status !== "stopped") this.status = "done";
+			if (this.status === "running" || this.status === "paused") this.status = "done";
 		} catch (e) {
-			if (this.status !== "stopped") {
+			if (this.status === "running" || this.status === "paused") {
 				this.status = "failed";
 				this.error = (e as Error)?.stack ?? String(e);
 			}
 		} finally {
 			this.endedAt = Date.now();
 			fs.writeFileSync(path.join(this.runDir, "result.json"), safeStringify(this.summary(true), 2));
+			this.writeState();
 			this.changed();
 		}
 	}

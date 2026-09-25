@@ -49,6 +49,7 @@ return audits.filter(Boolean)
 
 - Each run gets its own directory, `~/.pi/agent/ultracode/runs/<id>/`, holding `script.js`, `args.json`, `journal.jsonl`, `result.json`, and a session per agent under `agents/`.
 - **Resume:** `workflow { resume: "<id>" }` starts a new run in which any agent whose prompt and options match a finished agent in the old run returns its saved result.
+- **Interrupted runs:** a run lives in the pi process that started it. If that process exits (you quit pi, close the terminal, or it's killed), the run stops. `run.json` in the run directory records its owner process and session, so when you resume that session the run shows as **⚠ interrupted** in the widget and in `/workflows`, with a one-key **Resume** that reuses every finished agent. The agent is told about such runs too, so it won't assume they are still running. A run owned by another live pi process shows as running there.
 - **Concurrency:** `min(16, CPUs)` by default; override with `PI_WORKFLOW_MAX_CONCURRENT_AGENTS` (1–256). A run can start at most 1000 agents, and one `parallel()`/`pipeline()` call takes at most 4096 items.
 - **Where it runs:** in the TUI and RPC modes, runs happen in the background and the result arrives as a follow-up message that starts a new turn. In `pi -p` / JSON mode, the tool waits for the run to finish.
 - **Agents:** they use your session's model and thinking level unless the script or the config overrides them. They load your other pi extensions but cannot start nested workflows.
