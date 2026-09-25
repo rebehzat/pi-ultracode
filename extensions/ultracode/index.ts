@@ -264,17 +264,19 @@ export default function ultracode(pi: ExtensionAPI) {
 		}
 	}
 
-	function setMode(on: boolean, ctx: ExtensionContext, persist = true): void {
+	/** `restoredPrevious`: the pre-ultracode thinking level saved in the session, when restoring on resume. */
+	function setMode(on: boolean, ctx: ExtensionContext, persist = true, restoredPrevious?: string): void {
 		if (on === modeOn) return;
 		modeOn = on;
 		if (on) {
-			previousThinking = pi.getThinkingLevel();
+			previousThinking = restoredPrevious ?? pi.getThinkingLevel();
 			pi.setThinkingLevel("xhigh");
 		} else {
 			pi.setThinkingLevel((previousThinking as any) ?? "high");
 			ctx.ui.setWorkingMessage();
 		}
-		if (persist) pi.appendEntry(MODE_ENTRY, { on });
+		// Save the level to go back to, so turning ultracode off after a resume restores it too.
+		if (persist) pi.appendEntry(MODE_ENTRY, on ? { on, previousThinking } : { on });
 		editor?.setBadge(on);
 		ctxRef = ctx;
 		syncTicker();
@@ -623,14 +625,20 @@ export default function ultracode(pi: ExtensionAPI) {
 			});
 		}
 		let restored: boolean | undefined;
+		let restoredPrevious: string | undefined;
 		if (event.reason === "resume" || event.reason === "fork" || event.reason === "reload") {
 			for (const entry of ctx.sessionManager.getBranch() as any[]) {
-				if (entry?.type === "custom" && entry.customType === MODE_ENTRY) restored = !!entry.data?.on;
+				if (entry?.type === "custom" && entry.customType === MODE_ENTRY) {
+					restored = !!entry.data?.on;
+					restoredPrevious = entry.data?.previousThinking;
+				}
 			}
 		}
 		const want = restored ?? (!!pi.getFlag("ultracode") || !!config.ultracode);
+		// The new session brings its own thinking level; don't carry the old session's over.
 		modeOn = false;
-		if (want) setMode(true, ctx, false);
+		previousThinking = undefined;
+		if (want) setMode(true, ctx, false, restored ? restoredPrevious : undefined);
 		syncTicker();
 		refreshUI();
 	});
