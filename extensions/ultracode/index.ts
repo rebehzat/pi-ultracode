@@ -529,11 +529,6 @@ export default function ultracode(pi: ExtensionAPI) {
 		return lines.join("\n");
 	}
 
-	async function confirmDelete(ctx: ExtensionContext, title: string, message: string): Promise<boolean> {
-		// Deleting is irreversible, so the user confirms when there is someone to ask.
-		return !ctx.hasUI || (await ctx.ui.confirm(title, message));
-	}
-
 	pi.registerTool({
 		name: "workflow_manage",
 		label: "Workflow manage",
@@ -541,8 +536,8 @@ export default function ultracode(pi: ExtensionAPI) {
 			"Inspect and manage dynamic workflow runs and saved workflows. Actions: " +
 			"list (runs in this pi, this session's interrupted runs, recent runs on disk, saved workflows); " +
 			"status {id} (progress, agents, log, result); pause/resume/stop {id} (runs executing in this pi); " +
-			"dismiss {id} (hide an interrupted run); delete {id} (permanently remove a finished/stopped/interrupted run's files — asks the user); " +
-			"delete_saved {name} (remove a saved workflow command — asks the user). " +
+			"dismiss {id} (hide an interrupted run); delete {id} (permanently remove a finished/stopped/interrupted run's files); " +
+			"delete_saved {name} (remove a saved workflow command). " +
 			"To relaunch an interrupted or stopped run, use the workflow tool with { resume: id }, not this tool. " +
 			"Don't poll status in a loop: a running workflow's result arrives by itself as a follow-up message.",
 		promptSnippet: "workflow_manage: list, inspect, pause/resume/stop, dismiss and delete workflow runs and saved workflows",
@@ -619,9 +614,6 @@ export default function ultracode(pi: ExtensionAPI) {
 					const id = needId();
 					const rec = readRun(id);
 					if (!rec) throw new Error(`no workflow run "${id}"`);
-					if (!(await confirmDelete(ctx, "Delete workflow run?", `Permanently delete ${rec.name} (${id}): script, journal, results and agent sessions? It can't be resumed afterwards.`))) {
-						throw new Error("The user declined to delete this run.");
-					}
 					const res = deleteRun(id, liveIds());
 					if (!res.ok) throw new Error(res.error);
 					const i = runs.findIndex((r) => r.id === id);
@@ -634,9 +626,6 @@ export default function ultracode(pi: ExtensionAPI) {
 					if (!params.name) throw new Error('action "delete_saved" needs a name');
 					const saved = discoverSaved(ctx.cwd).get(params.name);
 					if (!saved) throw new Error(`no saved workflow "${params.name}"`);
-					if (!(await confirmDelete(ctx, "Delete saved workflow?", `Delete /${saved.name} (${saved.file})?`))) {
-						throw new Error("The user declined to delete this saved workflow.");
-					}
 					fs.rmSync(saved.file);
 					return text(`Deleted saved workflow /${saved.name} (${saved.file}). The command disappears after /reload.`);
 				}
@@ -727,7 +716,7 @@ export default function ultracode(pi: ExtensionAPI) {
 			const w = saved[labels.indexOf(pick)]!;
 			const act = await ctx.ui.select(`/${w.name} — ${w.file}`, ["View script", "Delete", "Back"]);
 			if (act === "View script") await ctx.ui.editor(`${w.file} (edits here are not saved)`, fs.readFileSync(w.file, "utf8"));
-			else if (act === "Delete" && (await ctx.ui.confirm("Delete saved workflow?", `Delete /${w.name} (${w.file})?`))) {
+			else if (act === "Delete") {
 				fs.rmSync(w.file);
 				ctx.ui.notify(`Deleted /${w.name}; the command disappears after /reload`, "info");
 			}
@@ -754,7 +743,6 @@ export default function ultracode(pi: ExtensionAPI) {
 			refreshDetached(ctx);
 			refreshUI();
 		} else if (choice === "Delete") {
-			if (!(await ctx.ui.confirm("Delete workflow run?", `Permanently delete ${r.name} (${r.id})? It can't be resumed afterwards.`))) return;
 			const res = deleteRun(r.id, new Set(runs.filter((x) => x.running).map((x) => x.id)));
 			ctx.ui.notify(res.ok ? `Deleted ${r.id}` : res.error, res.ok ? "info" : "error");
 			refreshDetached(ctx);
@@ -787,7 +775,6 @@ export default function ultracode(pi: ExtensionAPI) {
 			else if (choice === "View result") await ctx.ui.editor(`Result — ${run.meta.name}`, formatResult(run));
 			else if (choice === "Save as command") await saveRun(run, ctx);
 			else if (choice === "Delete run") {
-				if (!(await ctx.ui.confirm("Delete workflow run?", `Permanently delete ${run.meta.name} (${run.id})? It can't be resumed afterwards.`))) continue;
 				const res = deleteRun(run.id, new Set(runs.filter((r) => r.running).map((r) => r.id)));
 				if (!res.ok) ctx.ui.notify(res.error, "error");
 				else {
