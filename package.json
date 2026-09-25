@@ -1,0 +1,33 @@
+{
+  "name": "pi-ultracode",
+  "version": "0.1.0",
+  "description": "Claude Code-style ultracode for pi: dynamic workflows that orchestrate many subagents from a script, an ultracode mode with xhigh thinking, /workflows, and a rainbow keyword",
+  "type": "module",
+  "keywords": ["pi-package", "pi-extension", "workflows", "subagents", "ultracode"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/rebehzat/pi-ultracode" },
+  "pi": {
+    "extensions": ["extensions/ultracode/index.ts"]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types test/runtime.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "@earendil-works/pi-tui": { "optional": true },
+    "typebox": { "optional": true }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "latest",
+    "@earendil-works/pi-tui": "latest",
+    "@types/node": "^24.0.0",
+    "typebox": "latest",
+    "typescript": "^5.6.0"
+  }
+}
