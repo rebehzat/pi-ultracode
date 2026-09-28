@@ -17,7 +17,7 @@ import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { DEPTH_ENV } from "./agent.ts";
-import { keywordNote, type SizeGuideline, sizeText, TOOL_DESCRIPTION, ultracodeSystemPrompt } from "./prompt.ts";
+import { keywordGuidance, type SizeGuideline, sizeText, TOOL_DESCRIPTION, ultracodeSystemPrompt } from "./prompt.ts";
 import { normalizeArgs, sanitizeContext } from "./args.ts";
 import { KEYWORD_RE, rainbow, spinner, UltracodeEditor } from "./rainbow.ts";
 import { deleteRun, listRuns, patchRun, type RunRecord, readRun, runIdsFromSession, runState } from "./registry.ts";
@@ -881,7 +881,8 @@ export default function ultracode(pi: ExtensionAPI) {
 		if (!KEYWORD_RE.test(event.text)) return { action: "continue" };
 		turnIsUltracode = true;
 		syncTicker();
-		return { action: "transform", text: event.text + keywordNote(size()), images: event.images };
+		// Keep the user's message untouched; guidance belongs in the system prompt.
+		return { action: "continue" };
 	});
 
 	pi.on("before_agent_start", (event, ctx) => {
@@ -889,6 +890,7 @@ export default function ultracode(pi: ExtensionAPI) {
 		refreshDetached(ctx);
 		const extra: string[] = [];
 		if (modeOn) extra.push(ultracodeSystemPrompt(size()));
+		else if (turnIsUltracode) extra.push(keywordGuidance(size()));
 		const saved = [...discoverSaved(ctx.cwd).values()];
 		if (saved.length) {
 			extra.push(

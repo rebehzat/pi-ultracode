@@ -4,8 +4,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { emptyUsage, type SpawnOptions, type SpawnResult } from "../extensions/ultracode/agent.ts";
 import { parseScript, runsRoot, withMeta, WorkflowRun } from "../extensions/ultracode/runtime.ts";
+import { keywordGuidance, ultracodeSystemPrompt } from "../extensions/ultracode/prompt.ts";
 
 process.env.PI_CODING_AGENT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "ultracode-test-"));
+
+assert.doesNotMatch(keywordGuidance("medium"), /\[ultracode\]/);
+assert.match(keywordGuidance("medium"), /explicitly asks not to launch one/);
+assert.match(ultracodeSystemPrompt("medium"), /explicitly asks not to launch one/);
 
 let calls = 0;
 const stub = async (o: SpawnOptions): Promise<SpawnResult> => {

@@ -18,7 +18,7 @@ pi install git:github.com/rebehzat/pi-ultracode
 
 | | |
 |---|---|
-| `ultracode` keyword | Put it anywhere in a prompt you type to run that task as a workflow. The editor paints it in an animated rainbow. **Alt+W** dismisses it for that prompt. |
+| `ultracode` keyword | Put it anywhere in a prompt you type to run that task as a workflow. The editor paints it in an animated rainbow. **Alt+W** dismisses it for that prompt. The extension leaves your message unchanged and adds guidance to the system prompt instead; an explicit request not to launch a workflow takes precedence. |
 | `/ultracode [on\|off\|status]` | Ultracode mode: `xhigh` thinking + the model plans a workflow for every substantive task. An animated `⚡ultracode` badge appears on the editor border. `pi --ultracode` starts with it on. |
 | `workflow` tool | What the model calls. Takes `script` (or `script_path`, or `name` of a saved workflow), optional `args`, and `resume` (a run id). |
 | Live widget | Spinner, phase, agent counts, elapsed time and tokens for each running workflow, above the editor. |

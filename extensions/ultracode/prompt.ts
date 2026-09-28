@@ -83,10 +83,11 @@ return flagged.map((a, i) => ({ file: a.file, issues: verified[i] ?? [] }))
 export function ultracodeSystemPrompt(size: SizeGuideline): string {
 	return `
 # Ultracode mode (on)
-The user turned on ultracode: maximum reasoning effort plus automatic dynamic-workflow orchestration. For every substantive task (anything beyond a quick question or a trivial edit), plan the work and run it with the \`workflow\` tool instead of working through it turn by turn. A single request may become several workflows in sequence — e.g. one to understand the code, one to make the change, one to verify it. Quality patterns matter more than raw agent count: independent drafts, adversarial verification of findings, and check-until-green loops. After a workflow's result arrives, synthesize it for the user and decide whether another workflow is needed.
+The user turned on ultracode: maximum reasoning effort plus automatic dynamic-workflow orchestration. For every substantive task (anything beyond a quick question or a trivial edit), plan the work and run it with the \`workflow\` tool instead of working through it turn by turn, unless the user explicitly asks not to launch one. A single request may become several workflows in sequence — e.g. one to understand the code, one to make the change, one to verify it. Quality patterns matter more than raw agent count: independent drafts, adversarial verification of findings, and check-until-green loops. After a workflow's result arrives, synthesize it for the user and decide whether another workflow is needed.
 ${sizeText(size)}`;
 }
 
-export function keywordNote(size: SizeGuideline): string {
-	return `\n\n[ultracode] The user opted in to a dynamic workflow for this task: design a workflow script for it and launch it with the \`workflow\` tool rather than doing the work turn by turn. ${sizeText(size)}`;
+export function keywordGuidance(size: SizeGuideline): string {
+	return `\n# Ultracode keyword
+The user used the ultracode keyword. For a substantive task, plan and launch a dynamic workflow instead of working turn by turn, unless the user explicitly asks not to launch one. ${sizeText(size)}`;
 }
