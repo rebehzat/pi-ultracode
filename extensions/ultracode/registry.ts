@@ -27,7 +27,7 @@ export interface RunRecord {
 	total: number;
 	resumedBy?: string;
 	dismissed?: boolean;
-	/** Recomputed from child Pi sessions, including interrupted attempts. */
+	/** Lazily recomputed from child Pi sessions, including interrupted attempts. */
 	usage: Usage;
 }
 
@@ -61,16 +61,39 @@ export function readRun(id: string): RunRecord | undefined {
 	const dir = path.join(runsRoot(), id);
 	if (!fs.existsSync(path.join(dir, "script.js"))) return undefined;
 	const state = readJson(path.join(dir, "run.json"));
-	const result = readJson(path.join(dir, "result.json"));
-	let total = 0;
-	try {
-		total = fs.readdirSync(path.join(dir, "agents")).length;
-	} catch {}
-	const done = countLines(path.join(dir, "journal.jsonl"));
-	let startedAt = 0;
-	try {
-		startedAt = fs.statSync(path.join(dir, "script.js")).mtimeMs;
-	} catch {}
+	// Modern runs persist status and agent counts in a small run.json. Reading result.json
+	// and the journal for every directory makes session-start and before_agent_start
+	// proportional to the size of *all* previous workflows, even unrelated ones.
+	// Finalization writes result.json before its final run.json update. A crash in
+	// between must not turn a completed run into resumable unfinished work.
+	const staleRunning = (state?.status === "running" || state?.status === "paused") && !pidAlive(state?.pid);
+	const result = state?.status && state?.name && !staleRunning ? undefined : readJson(path.join(dir, "result.json"));
+	const recordedCounts = result?.agents ?? state?.agents;
+	const modernCounts = Number.isSafeInteger(recordedCounts?.total) && recordedCounts.total >= 0 &&
+		Number.isSafeInteger(recordedCounts?.done) && recordedCounts.done >= 0;
+	const status = result?.status ?? state?.status ?? "running";
+	// A crashed writer can leave run.json counts up to five seconds behind its
+	// journal. Only resolve that journal when the interrupted run's count is used.
+	const interrupted = status === "interrupted" || ((status === "running" || status === "paused") && !pidAlive(state?.pid));
+	let counts: { done: number; total: number } | undefined;
+	const getCounts = () => {
+		if (!counts) {
+			const done = modernCounts && !interrupted ? recordedCounts.done : countLines(path.join(dir, "journal.jsonl"));
+			let total = modernCounts ? recordedCounts.total : 0;
+			if (!modernCounts) {
+				try { total = fs.readdirSync(path.join(dir, "agents")).length; } catch {}
+			}
+			counts = { done: Math.max(done, modernCounts ? recordedCounts.done : 0), total: Math.max(total, done) };
+		}
+		return counts;
+	};
+	let startedAt = state?.startedAt;
+	if (startedAt == null) {
+		try {
+			startedAt = fs.statSync(path.join(dir, "script.js")).mtimeMs;
+		} catch { startedAt = 0; }
+	}
+	let usage: Usage | undefined;
 	return {
 		id,
 		name: state?.name ?? result?.name ?? id.replace(/-[0-9a-f]{6}$/, ""),
@@ -78,15 +101,15 @@ export function readRun(id: string): RunRecord | undefined {
 		sessionId: state?.sessionId,
 		cwd: state?.cwd,
 		pid: state?.pid,
-		// A result file means the run ended; otherwise trust run.json; legacy runs without either never finished.
-		status: result?.status ?? state?.status ?? "running",
-		startedAt: state?.startedAt ?? startedAt,
+		// Modern metadata is authoritative except for finalization interrupted by a crash.
+		status,
+		startedAt,
 		endedAt: state?.endedAt,
-		done,
-		total: Math.max(total, done),
+		get done() { return getCounts().done; },
+		get total() { return getCounts().total; },
 		resumedBy: state?.resumedBy,
 		dismissed: state?.dismissed,
-		usage: readRunUsage(dir).usage,
+		get usage() { return usage ??= readRunUsage(dir).usage; },
 	};
 }
 

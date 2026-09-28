@@ -9,7 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vm from "node:vm";
-import { addUsage, emptyUsage, runPiAgent, type Usage } from "./agent.ts";
+import { addUsage, emptyUsage, isPermanentError, runPiAgent, type Usage } from "./agent.ts";
 import { readRunUsage } from "./usage.ts";
 import { extractJson, findContradiction, validate, type JsonSchema } from "./schema.ts";
 
@@ -159,19 +159,32 @@ globalThis.args = __argsJson === undefined ? undefined : JSON.parse(__argsJson);
 class Gate {
 	active = 0;
 	paused = false;
-	private waiters: (() => void)[] = [];
+	private waiters: { signal: AbortSignal; enter: () => void; abort: () => void }[] = [];
 	limit: number;
 	constructor(limit: number) {
 		this.limit = limit;
 	}
 
-	async acquire(signal: AbortSignal): Promise<void> {
-		while (this.paused || this.active >= this.limit) {
-			if (signal.aborted) throw new Error("aborted");
-			await new Promise<void>((r) => this.waiters.push(r));
-		}
-		if (signal.aborted) throw new Error("aborted");
-		this.active++;
+	acquire(signal: AbortSignal): Promise<void> {
+		if (signal.aborted) return Promise.reject(new Error("aborted"));
+		return new Promise<void>((resolve, reject) => {
+			const waiter = {
+				signal,
+				enter: () => {
+					signal.removeEventListener("abort", waiter.abort);
+					this.active++;
+					resolve();
+				},
+				abort: () => {
+					const index = this.waiters.indexOf(waiter);
+					if (index >= 0) this.waiters.splice(index, 1);
+					reject(new Error("aborted"));
+				},
+			};
+			this.waiters.push(waiter);
+			signal.addEventListener("abort", waiter.abort, { once: true });
+			this.wake();
+		});
 	}
 
 	release(): void {
@@ -180,9 +193,12 @@ class Gate {
 	}
 
 	wake(): void {
-		const w = this.waiters;
-		this.waiters = [];
-		w.forEach((f) => f());
+		// Reserve only available slots, rather than waking/requeuing the whole fan-out.
+		while (!this.paused && this.active < this.limit && this.waiters.length) {
+			const waiter = this.waiters.shift()!;
+			if (waiter.signal.aborted) waiter.abort();
+			else waiter.enter();
+		}
 	}
 }
 
@@ -218,7 +234,7 @@ export class WorkflowRun {
 	}
 
 	refreshUsage(force = false): void {
-		if (!force && this.usageSnapshot && Date.now() - this.usageReadAt < 250) return;
+		if (!force && this.usageSnapshot && Date.now() - this.usageReadAt < 1000) return;
 		this.usageSnapshot = readRunUsage(this.runDir);
 		this.usageReadAt = Date.now();
 		for (const state of this.agents) {
@@ -423,7 +439,7 @@ export class WorkflowRun {
 		}
 
 		try {
-			await this.gate.acquire(this.controller.signal);
+			await this.gate.acquire(AbortSignal.any([this.controller.signal, state.controller.signal]));
 		} catch {
 			state.status = "stopped";
 			this.changed();
@@ -440,6 +456,7 @@ export class WorkflowRun {
 		const opts = state.options;
 		const onRunAbort = () => state.controller.abort();
 		this.controller.signal.addEventListener("abort", onRunAbort, { once: true });
+		if (this.controller.signal.aborted) onRunAbort();
 		try {
 			while (true) {
 				state.status = "running";
@@ -505,7 +522,6 @@ export class WorkflowRun {
 		let apiRetries = 0;
 		for (let attempt = 1; attempt <= maxAttempts; ) {
 			const before = { ...state.usage };
-			this.refreshUsage(true);
 			const res = await (this.defaults.runAgent ?? runPiAgent)({
 				prompt,
 				continueSession,
@@ -532,11 +548,14 @@ export class WorkflowRun {
 			this.refreshUsage(true);
 			if (res.model) state.model = res.model;
 			if (res.aborted || state.controller.signal.aborted) return { kind: "stopped" };
-			if (res.exitCode !== 0 || res.stopReason === "error") {
-				// One retry for transient API/process failures, then give up (resolves null).
-				if (apiRetries++ < 1) {
+			if (res.exitCode !== 0 || res.stopReason === "error" || res.retryExhausted) {
+				// Pi already retries API failures internally. Never repeat the whole task for
+				// permanent auth/config errors, or when Pi exhausted its own retry budget.
+				if (apiRetries++ < 1 && !res.retryExhausted && !isPermanentError(res.error)) {
 					continueSession = false;
 					sessionDir = path.join(agentDir, `attempt-${attemptIndex++}`);
+					// A fresh session must receive the task, not just a schema-correction prompt.
+					prompt = state.prompt + (opts.schema ? `\n\nReply with ONLY JSON matching this schema:\n${JSON.stringify(opts.schema)}` : "");
 					continue;
 				}
 				return { kind: "error", error: res.error ?? "agent failed", throws: false };

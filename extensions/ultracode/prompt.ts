@@ -62,7 +62,7 @@ return flagged.map((a, i) => ({ file: a.file, issues: verified[i] ?? [] }))
 \`\`\`
 
 ## Primitives (globals; plain JS with top-level await and top-level return)
-- agent(prompt, opts?) → Promise. Spawns one fresh pi subagent with its own context and the normal tools (read/bash/edit/write…). It does NOT see this conversation: put every fact it needs in the prompt (paths, goals, constraints, output format). Resolves to the agent's final message text, or to the parsed JSON when opts.schema is given (validated; the agent is asked to fix invalid output, and the call throws if it still fails). Resolves null if the agent is stopped or hits an unrecoverable error.
+- agent(prompt, opts?) → Promise. Spawns one fresh pi subagent with its own context and normal work tools (read/bash/edit/write…). Workers cannot spawn or manage nested agents; do all orchestration in the workflow script. It does NOT see this conversation: put every fact it needs in the prompt (paths, goals, constraints, output format). Resolves to the agent's final message text, or to the parsed JSON when opts.schema is given (validated; the agent is asked to fix invalid output, and the call throws if it still fails). Resolves null if the agent is stopped or hits an unrecoverable error.
   opts: { label, schema (JSON Schema), model ("provider/id"), thinking ("off"|"low"|"medium"|"high"|"xhigh"), tools (["read","bash",…]), cwd, systemPrompt }
 - parallel([promiseOrFn, …]) → Promise<array>. Runs everything at once, waits for all. A rejection becomes null (and is logged) instead of failing the run.
 - pipeline(items, (item, index) => promise) → Promise<array>. One task per item, all at once (the runtime caps real concurrency). Rejections become null. Always .filter(Boolean) before using results.
@@ -78,6 +78,9 @@ return flagged.map((a, i) => ({ file: a.file, issues: verified[i] ?? [] }))
 - Parallel agents share the working tree: never let two agents edit the same file at once. For edits, give each agent a disjoint set of files, or have agents propose patches and apply them in a later single-agent phase.
 - Prefer schemas for anything the script branches on. Keep prompts self-contained and specific.
 - Good patterns: fan-out then adversarial verify; loop until a check passes or stops improving (while loop around agent calls with a round cap); several independent drafts then a judge; discover → shard → process → merge.
+- Worker thinking defaults to at most medium, independently of the orchestrator's effort. Use opts.thinking: "high" or "xhigh" only for genuinely difficult reasoning; "low" for mechanical discovery or checks.
+- Optimize elapsed time: use parallel()/pipeline() for independent work, batch tiny related tasks into one agent, and avoid discovery agents when paths/context are already known. Don't serialize independent tasks with await in a loop.
+- Prefer one bounded implementation-and-verification workflow over repeated discovery/plan/implement/review workflows. Verify concrete changes or flagged findings, not every negative result. Cap repair loops and stop when checks pass.
 - Cost scales with agent count. Use cheaper models/thinking for mechanical stages via opts.model / opts.thinking.`;
 
 export const workflowBasics = "Workflows are available via the workflow tool for explicit requests; otherwise handle the task normally.";
@@ -85,6 +88,6 @@ export const workflowBasics = "Workflows are available via the workflow tool for
 export function ultracodeSystemPrompt(size: SizeGuideline): string {
 	return `
 # Ultracode mode (on)
-The user turned on ultracode: maximum reasoning effort plus automatic dynamic-workflow orchestration. For every substantive task (anything beyond a quick question or a trivial edit), plan the work and run it with the \`workflow\` tool instead of working through it turn by turn, unless the user explicitly asks not to launch one. A single request may become several workflows in sequence — e.g. one to understand the code, one to make the change, one to verify it. Quality patterns matter more than raw agent count: independent drafts, adversarial verification of findings, and check-until-green loops. After a workflow's result arrives, synthesize it for the user and decide whether another workflow is needed.
+The user turned on ultracode: maximum reasoning effort plus automatic dynamic-workflow orchestration. For every substantive task (anything beyond a quick question or a trivial edit), plan the work and run it with the \`workflow\` tool instead of working through it turn by turn, unless the user explicitly asks not to launch one. Prefer one bounded workflow that implements and verifies the task. Parallelize independent work, batch small related tasks, and give agents the paths and context already known instead of repeating discovery. Use targeted verification and bounded repair loops; do not add redundant planning, drafting, or review stages once checks pass. Routine workers default to at most medium thinking; request high/xhigh explicitly only for difficult reasoning. After the result arrives, synthesize it for the user; launch another workflow only if concrete unfinished work remains.
 ${sizeText(size)}`;
 }

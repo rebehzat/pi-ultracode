@@ -15,6 +15,7 @@ import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { DEPTH_ENV } from "./agent.ts";
+import { agentThinking, positiveLimit } from "./config.ts";
 import { type SizeGuideline, sizeText, TOOL_DESCRIPTION, ultracodeSystemPrompt, workflowBasics } from "./prompt.ts";
 import { normalizeArgs, sanitizeContext } from "./args.ts";
 import { rainbow, spinner, UltracodeEditor } from "./rainbow.ts";
@@ -27,7 +28,7 @@ interface Config {
 	maxStructuredRetries?: number;
 	/** Replace the input editor to show the on-mode badge. Default true. */
 	rainbowEditor?: boolean;
-	/** Thinking level for workflow agents. Default: the session's current level. */
+	/** Worker effort defaults to at most medium; "inherit" restores session-level effort. */
 	agentThinking?: string;
 	/** Model for workflow agents ("provider/id"). Default: the session's model. */
 	agentModel?: string;
@@ -326,7 +327,8 @@ export default function ultracode(pi: ExtensionAPI) {
 	// ── running workflows ──
 
 	function defaults(ctx: ExtensionContext) {
-		const envMax = Number(process.env.PI_WORKFLOW_MAX_CONCURRENT_AGENTS);
+		const maxConcurrent = positiveLimit(process.env.PI_WORKFLOW_MAX_CONCURRENT_AGENTS,
+			positiveLimit(config.maxConcurrentAgents, Math.min(16, os.availableParallelism?.() ?? os.cpus().length), 256), 256);
 		let sessionId: string | undefined;
 		try {
 			sessionId = ctx.sessionManager.getSessionId();
@@ -335,12 +337,10 @@ export default function ultracode(pi: ExtensionAPI) {
 			cwd: ctx.cwd,
 			sessionId,
 			model: config.agentModel ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
-			thinking: config.agentThinking ?? pi.getThinkingLevel(),
-			maxConcurrent: Math.max(
-				1,
-				Math.min(256, envMax || config.maxConcurrentAgents || Math.min(16, os.availableParallelism?.() ?? os.cpus().length)),
-			),
-			maxStructuredRetries: Number(process.env.MAX_STRUCTURED_OUTPUT_RETRIES) || config.maxStructuredRetries || 5,
+			thinking: agentThinking(config.agentThinking, pi.getThinkingLevel()),
+			maxConcurrent,
+			maxStructuredRetries: positiveLimit(process.env.MAX_STRUCTURED_OUTPUT_RETRIES,
+				positiveLimit(config.maxStructuredRetries, 3, 10), 10),
 		};
 	}
 
@@ -614,7 +614,7 @@ export default function ultracode(pi: ExtensionAPI) {
 			ctxRef = ctx;
 			const a = arg.trim().toLowerCase();
 			if (a === "status") {
-				ctx.ui.notify(`ultracode is ${modeOn ? "on" : "off"} · ${sizeText(size())}`, "info");
+				ctx.ui.notify(`ultracode is ${modeOn ? "on" : "off"} · workers: ${agentThinking(config.agentThinking, pi.getThinkingLevel())} thinking · ${sizeText(size())}`, "info");
 				return;
 			}
 			if (a && a !== "on" && a !== "off") {
@@ -633,7 +633,7 @@ export default function ultracode(pi: ExtensionAPI) {
 			setMode(next, ctx);
 			ctx.ui.notify(
 				next
-					? `${rainbow("ultracode", 0, { bold: true })} on — xhigh thinking, Claude plans a workflow for each substantive task`
+					? `${rainbow("ultracode", 0, { bold: true })} on — xhigh orchestration, ${agentThinking(config.agentThinking, pi.getThinkingLevel())} worker thinking`
 					: `ultracode off — thinking back to ${pi.getThinkingLevel()}`,
 				"info",
 			);

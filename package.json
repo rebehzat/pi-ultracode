@@ -11,7 +11,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types test/runtime.test.ts"
+    "test": "node test/run.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
