@@ -4,7 +4,7 @@ Claude Code's **ultracode** / **dynamic workflows** for [pi](https://pi.dev).
 
 The model writes a short JavaScript script that orchestrates many subagents. The script runs in the background, holds the loops, branching and intermediate results itself, and only its final return value comes back into your conversation. Use it for codebase-wide audits, many-file migrations, research that needs cross-checking, or drafting a hard plan from several independent angles.
 
-Run `/ultracode` to enable automatic workflows, then ask for an audit. Without the command, ultracode stays off: typing “ultracode” in an ordinary message does not enable it. You can still request a workflow explicitly or use the `workflow` tool while off.
+Run `/ultracode` to enable automatic workflows, then ask for an audit. Without the command, ultracode stays off: typing “ultracode” in an ordinary message does not enable it. You can still request a workflow explicitly or use the `workflow` tool while off. Ultra and ultracode are mutually exclusive: run `/ultra` to turn Ultra off before activating `/ultracode`.
 
 ## Install
 

@@ -622,6 +622,14 @@ export default function ultracode(pi: ExtensionAPI) {
 				return;
 			}
 			const next = a === "on" ? true : a === "off" ? false : !modeOn;
+			if (next && !modeOn) {
+				const branch = ctx.sessionManager.getBranch() as Array<{ type?: string; customType?: string; data?: { on?: boolean } }>;
+				const ultra = [...branch].reverse().find((entry) => entry.type === "custom" && entry.customType === "ultra-mode");
+				if (ultra?.data?.on === true) {
+					ctx.ui.notify("Ultra is active. Run /ultra to turn it off before /ultracode.", "warning");
+					return;
+				}
+			}
 			setMode(next, ctx);
 			ctx.ui.notify(
 				next
