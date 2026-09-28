@@ -1,6 +1,6 @@
 /**
  * Model-facing text: the workflow tool description (authoring reference) and
- * the ultracode guidance appended to the system prompt / user prompt.
+ * the ultracode guidance appended to the system prompt.
  */
 
 export type SizeGuideline = "small" | "medium" | "large" | "unrestricted";
@@ -20,7 +20,7 @@ export function sizeText(size: SizeGuideline): string {
 
 export const TOOL_DESCRIPTION = `Launch a dynamic workflow: a JavaScript script that orchestrates many subagents in the background. The script holds the plan, loops and intermediate results; only its final return value comes back to you.
 
-Use it when a task needs more agents than one conversation can coordinate (codebase-wide audits, many-file migrations, research that needs sources cross-checked, a hard plan drafted from several independent angles), or when the user asks for a workflow / says "ultracode".
+Use it when the user explicitly requests a workflow, or for substantive tasks while /ultracode mode is on. Otherwise handle tasks normally. It can coordinate subagents for codebase-wide audits, migrations, or cross-checked research.
 
 The run starts in the background and this tool returns immediately. The final result arrives later as a follow-up message — do not poll, do not wait, do not launch the same workflow twice. You may keep talking to the user or end your turn.
 
@@ -80,14 +80,11 @@ return flagged.map((a, i) => ({ file: a.file, issues: verified[i] ?? [] }))
 - Good patterns: fan-out then adversarial verify; loop until a check passes or stops improving (while loop around agent calls with a round cap); several independent drafts then a judge; discover → shard → process → merge.
 - Cost scales with agent count. Use cheaper models/thinking for mechanical stages via opts.model / opts.thinking.`;
 
+export const workflowBasics = "Workflows are available via the workflow tool for explicit requests; otherwise handle the task normally.";
+
 export function ultracodeSystemPrompt(size: SizeGuideline): string {
 	return `
 # Ultracode mode (on)
 The user turned on ultracode: maximum reasoning effort plus automatic dynamic-workflow orchestration. For every substantive task (anything beyond a quick question or a trivial edit), plan the work and run it with the \`workflow\` tool instead of working through it turn by turn, unless the user explicitly asks not to launch one. A single request may become several workflows in sequence — e.g. one to understand the code, one to make the change, one to verify it. Quality patterns matter more than raw agent count: independent drafts, adversarial verification of findings, and check-until-green loops. After a workflow's result arrives, synthesize it for the user and decide whether another workflow is needed.
 ${sizeText(size)}`;
-}
-
-export function keywordGuidance(size: SizeGuideline): string {
-	return `\n# Ultracode keyword
-The user used the ultracode keyword. For a substantive task, plan and launch a dynamic workflow instead of working turn by turn, unless the user explicitly asks not to launch one. ${sizeText(size)}`;
 }

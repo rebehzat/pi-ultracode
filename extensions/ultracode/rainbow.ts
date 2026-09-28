@@ -3,7 +3,7 @@
  */
 
 import { CustomEditor } from "@earendil-works/pi-coding-agent";
-import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
 // coral → yellow → green → teal → blue → purple → pink
 const COLORS: [number, number, number][] = [
@@ -47,15 +47,10 @@ export function rainbow(text: string, frame: number, opts: { bold?: boolean } = 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 export const spinner = (frame: number) => SPINNER[frame % SPINNER.length]!;
 
-export const KEYWORD_RE = /\bultracode\b/i;
-
-/** Editor that paints the `ultracode` keyword in an animated rainbow while it is typed. */
+/** Editor that shows an animated badge only while ultracode mode is on. */
 export class UltracodeEditor extends CustomEditor {
 	private timer?: ReturnType<typeof setInterval>;
 	private frame = 0;
-	dismissed = false;
-	/** Whether the keyword was dismissed on the prompt that was just submitted. */
-	submittedDismissed = false;
 	/** Show the animated ⚡ultracode badge in the top border (ultracode mode on). */
 	private badge = false;
 
@@ -65,45 +60,20 @@ export class UltracodeEditor extends CustomEditor {
 		this.tui.requestRender();
 	}
 
-	private hasKeyword(): boolean {
-		return !this.dismissed && KEYWORD_RE.test(this.getText());
-	}
-
-	sync(): void {
-		const active = this.badge || this.hasKeyword();
-		if (active && !this.timer) {
+	private sync(): void {
+		if (this.badge && !this.timer) {
 			this.timer = setInterval(() => {
 				this.frame++;
 				this.tui.requestRender();
 			}, 70);
-		} else if (!active && this.timer) {
+		} else if (!this.badge && this.timer) {
 			clearInterval(this.timer);
 			this.timer = undefined;
 		}
 	}
 
-	handleInput(data: string): void {
-		// Alt+W dismisses the keyword highlight for this prompt, like Claude Code.
-		if (matchesKey(data, "alt+w") && KEYWORD_RE.test(this.getText())) {
-			this.dismissed = !this.dismissed;
-			this.sync();
-			this.tui.requestRender();
-			return;
-		}
-		const wasDismissed = this.dismissed;
-		super.handleInput(data);
-		if (!this.getText().trim()) {
-			if (wasDismissed) this.submittedDismissed = true;
-			this.dismissed = false;
-		}
-		this.sync();
-	}
-
 	render(width: number): string[] {
-		let lines = super.render(width);
-		if (!this.dismissed) {
-			lines = lines.map((line) => line.replace(/\bultracode\b/gi, (m) => rainbow(m, this.frame, { bold: true })));
-		}
+		const lines = super.render(width);
 		if (this.badge && lines.length) {
 			// Overlay the badge on the trailing run of border characters, keeping the visible width.
 			const label = "⚡ultracode";

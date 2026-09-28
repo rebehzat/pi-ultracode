@@ -10,6 +10,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vm from "node:vm";
 import { addUsage, emptyUsage, runPiAgent, type Usage } from "./agent.ts";
+import { readRunUsage } from "./usage.ts";
 import { extractJson, findContradiction, validate, type JsonSchema } from "./schema.ts";
 
 export const MAX_AGENTS_PER_RUN = 1000;
@@ -204,7 +205,28 @@ export class WorkflowRun {
 	endedAt?: number;
 	result?: unknown;
 	error?: string;
-	readonly usage = emptyUsage();
+	private usageSnapshot?: ReturnType<typeof readRunUsage>;
+	private usageReadAt = 0;
+	/** Persisted child sessions are authoritative; streaming totals are only a pre-persistence fallback. */
+	get usage(): Usage {
+		this.refreshUsage();
+		const total = { ...this.usageSnapshot!.usage };
+		for (const state of this.agents) {
+			if (state.status !== "cached" && !this.usageSnapshot!.files.has(state.index)) addUsage(total, state.usage);
+		}
+		return total;
+	}
+
+	refreshUsage(force = false): void {
+		if (!force && this.usageSnapshot && Date.now() - this.usageReadAt < 250) return;
+		this.usageSnapshot = readRunUsage(this.runDir);
+		this.usageReadAt = Date.now();
+		for (const state of this.agents) {
+			if (state.status !== "cached" && this.usageSnapshot.files.has(state.index)) {
+				state.usage = { ...this.usageSnapshot.agents.get(state.index)! };
+			}
+		}
+	}
 
 	private readonly controller = new AbortController();
 	private readonly gate: Gate;
@@ -393,7 +415,8 @@ export class WorkflowRun {
 		if (cached) {
 			state.status = "cached";
 			state.result = cached.result;
-			state.usage = cached.usage;
+			// Journal usage belongs to the original run, not this replay.
+			state.usage = emptyUsage();
 			this.appendJournal(cached);
 			this.changed();
 			return cached.result;
@@ -460,8 +483,17 @@ export class WorkflowRun {
 		state: AgentState,
 	): Promise<{ kind: "ok"; value: unknown } | { kind: "stopped" } | { kind: "error"; error: string; throws: boolean }> {
 		const opts = state.options;
-		const sessionDir = path.join(this.runDir, "agents", String(state.index));
-		fs.rmSync(sessionDir, { recursive: true, force: true });
+		// Give each fresh process attempt its own directory. API retries and manual restarts
+		// must not delete already billed entries; schema corrections continue the same session.
+		const agentDir = path.join(this.runDir, "agents", String(state.index));
+		let attemptIndex = 0;
+		try {
+			for (const name of fs.readdirSync(agentDir)) {
+				const match = /^attempt-(\d+)$/.exec(name);
+				if (match) attemptIndex = Math.max(attemptIndex, Number(match[1]) + 1);
+			}
+		} catch {}
+		let sessionDir = path.join(agentDir, `attempt-${attemptIndex++}`);
 		let prompt = state.prompt;
 		if (opts.schema) {
 			prompt +=
@@ -473,6 +505,7 @@ export class WorkflowRun {
 		let apiRetries = 0;
 		for (let attempt = 1; attempt <= maxAttempts; ) {
 			const before = { ...state.usage };
+			this.refreshUsage(true);
 			const res = await (this.defaults.runAgent ?? runPiAgent)({
 				prompt,
 				continueSession,
@@ -496,14 +529,14 @@ export class WorkflowRun {
 			});
 			state.usage = { ...before };
 			addUsage(state.usage, res.usage);
-			addUsage(this.usage, res.usage);
+			this.refreshUsage(true);
 			if (res.model) state.model = res.model;
 			if (res.aborted || state.controller.signal.aborted) return { kind: "stopped" };
 			if (res.exitCode !== 0 || res.stopReason === "error") {
 				// One retry for transient API/process failures, then give up (resolves null).
 				if (apiRetries++ < 1) {
 					continueSession = false;
-					fs.rmSync(sessionDir, { recursive: true, force: true });
+					sessionDir = path.join(agentDir, `attempt-${attemptIndex++}`);
 					continue;
 				}
 				return { kind: "error", error: res.error ?? "agent failed", throws: false };
@@ -581,6 +614,7 @@ export class WorkflowRun {
 			}
 		} finally {
 			this.endedAt = Date.now();
+			this.refreshUsage(true);
 			fs.writeFileSync(path.join(this.runDir, "result.json"), safeStringify(this.summary(true), 2));
 			this.writeState();
 			this.changed();

@@ -4,9 +4,7 @@ Claude Code's **ultracode** / **dynamic workflows** for [pi](https://pi.dev).
 
 The model writes a short JavaScript script that orchestrates many subagents. The script runs in the background, holds the loops, branching and intermediate results itself, and only its final return value comes back into your conversation. Use it for codebase-wide audits, many-file migrations, research that needs cross-checking, or drafting a hard plan from several independent angles.
 
-```
-ultracode: audit every route handler under src/routes/ for missing auth checks, and adversarially verify each finding
-```
+Run `/ultracode` to enable automatic workflows, then ask for an audit. Without the command, ultracode stays off: typing “ultracode” in an ordinary message does not enable it. You can still request a workflow explicitly or use the `workflow` tool while off.
 
 ## Install
 
@@ -18,10 +16,9 @@ pi install git:github.com/rebehzat/pi-ultracode
 
 | | |
 |---|---|
-| `ultracode` keyword | Put it anywhere in a prompt you type to run that task as a workflow. The editor paints it in an animated rainbow. **Alt+W** dismisses it for that prompt. The extension leaves your message unchanged and adds guidance to the system prompt instead; an explicit request not to launch a workflow takes precedence. |
-| `/ultracode [on\|off\|status]` | Ultracode mode: `xhigh` thinking + the model plans a workflow for every substantive task. An animated `⚡ultracode` badge appears on the editor border. `pi --ultracode` starts with it on. |
+| `/ultracode [on\|off\|status]` | Off by default. Bare `/ultracode` toggles; `on` enables `xhigh` thinking and automatic workflows for substantive tasks, `off` restores your previous thinking level, and `status` reports the mode. Only this command enables the mode. An animated `⚡ultracode` badge appears on the editor border while on. |
 | `workflow` tool | What the model calls. Takes `script` (or `script_path`, or `name` of a saved workflow), optional `args`, and `resume` (a run id). |
-| Live widget | Spinner, phase, agent counts, elapsed time and tokens for each running workflow, above the editor. |
+| Live widget | Spinner, phase, agent counts, elapsed time, tokens and cost for each running workflow, above the editor. |
 | `/workflows` | Browse runs → phases/agents (prompt, tool calls, result), log, pause/resume, stop, stop/restart one agent, view script/result, **save as a command**, **delete** finished or interrupted runs. Saved workflows are listed at the bottom (view/delete). |
 | `workflow_manage` tool | Lets the agent `list` runs and saved workflows, get a run's `status`, `pause`/`resume`/`stop` runs executing in this pi, `dismiss` interrupted runs, and `delete` runs or saved workflows. Deletes happen immediately, without a confirmation prompt. |
 | Saved workflows | Saved to `.pi/workflows/` (project, nearest dir wins) or `~/.pi/agent/workflows/` (personal), and run as `/<name> [args]`. JSON args go straight to the script; free-form text is passed to the model to turn into structured args. |
@@ -48,8 +45,9 @@ return audits.filter(Boolean)
 
 ## How it runs
 
-- Each run gets its own directory, `~/.pi/agent/ultracode/runs/<id>/`, holding `script.js`, `args.json`, `journal.jsonl`, `result.json`, and a session per agent under `agents/`.
+- Each run gets its own directory, `~/.pi/agent/ultracode/runs/<id>/`, holding `script.js`, `args.json`, `journal.jsonl`, `result.json`, and child Pi sessions under `agents/<index>/`. Fresh retries and restarts use separate `attempt-*` session directories so prior charges remain available.
 - **Resume:** `workflow { resume: "<id>" }` starts a new run in which any agent whose prompt and options match a finished agent in the old run returns its saved result.
+- **Cost/usage:** the widget, status, and result sum persisted billable Pi session entries for every workflow child (including interrupted runs, failed attempts, abandoned branches, and the original sessions of resumed runs). Cached journal replays and JSON stream events are not added again; live totals refresh as sessions are written. Assistant, tool-result, explicit usage, compaction, and branch-summary usage are included; reasoning tokens are already part of output. These workflow totals are separate from the parent Pi session's total. Older runs whose failed attempt directories were deleted before this version cannot recover those missing charges; deleting an original run's files likewise removes its historical usage from a resumed run's reported total.
 - **Interrupted runs:** a run lives in the pi process that started it. If that process exits (you quit pi, close the terminal, or it's killed), the run stops. `run.json` in the run directory records its owner process and session, so when you resume that session the run shows as **⚠ interrupted** in the widget and in `/workflows`, with a one-key **Resume** that reuses every finished agent. The agent is told about such runs too, so it won't assume they are still running. A run owned by another live pi process shows as running there.
 - **Concurrency:** `min(16, CPUs)` by default; override with `PI_WORKFLOW_MAX_CONCURRENT_AGENTS` (1–256). A run can start at most 1000 agents, and one `parallel()`/`pipeline()` call takes at most 4096 items.
 - **Where it runs:** in the TUI and RPC modes, runs happen in the background and the result arrives as a follow-up message that starts a new turn. In `pi -p` / JSON mode, the tool waits for the run to finish.
@@ -62,8 +60,6 @@ Optional `~/.pi/agent/ultracode.json`:
 
 ```json
 {
-  "ultracode": false,
-  "keywordTrigger": true,
   "sizeGuideline": "medium",
   "rainbowEditor": true,
   "maxConcurrentAgents": 16,
@@ -73,7 +69,7 @@ Optional `~/.pi/agent/ultracode.json`:
 }
 ```
 
-`sizeGuideline` is advice to the model, not a cap: `small` (<5 agents), `medium` (<10), `large` (<50), `unrestricted`. `rainbowEditor` swaps in pi's editor component; turn it off if another extension provides its own editor.
+`sizeGuideline` is advice to the model while mode is on, not a cap: `small` (<5 agents), `medium` (<10), `large` (<50), `unrestricted`. `rainbowEditor` swaps in pi's editor component for the on-mode badge; turn it off if another extension provides its own editor. Neither config nor a CLI flag enables ultracode.
 
 ## Differences from Claude Code
 

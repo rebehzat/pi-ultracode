@@ -7,6 +7,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { runsRoot } from "./runtime.ts";
+import { readRunUsage } from "./usage.ts";
+import type { Usage } from "./agent.ts";
 
 export type RunState = "live" | "elsewhere" | "interrupted" | "finished";
 
@@ -25,6 +27,8 @@ export interface RunRecord {
 	total: number;
 	resumedBy?: string;
 	dismissed?: boolean;
+	/** Recomputed from child Pi sessions, including interrupted attempts. */
+	usage: Usage;
 }
 
 function readJson(file: string): any {
@@ -82,6 +86,7 @@ export function readRun(id: string): RunRecord | undefined {
 		total: Math.max(total, done),
 		resumedBy: state?.resumedBy,
 		dismissed: state?.dismissed,
+		usage: readRunUsage(dir).usage,
 	};
 }
 

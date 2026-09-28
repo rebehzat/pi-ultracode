@@ -4,9 +4,7 @@
  *   - `workflow` tool: the model writes a JS script that orchestrates many
  *     subagents (agent / parallel / pipeline / phase / log); it runs in the
  *     background and its return value comes back as a follow-up message.
- *   - `ultracode` keyword: opt a single prompt into a workflow (rainbow-highlighted
- *     in the editor; Alt+W dismisses it).
- *   - `/ultracode [on|off]`: xhigh thinking + automatic workflow orchestration.
+ *   - `/ultracode [on|off|status]`: opt into xhigh thinking + automatic workflow orchestration.
  *   - `/workflows`: inspect, pause, stop and save runs; saved workflows become `/name` commands.
  */
 
@@ -17,21 +15,17 @@ import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { DEPTH_ENV } from "./agent.ts";
-import { keywordGuidance, type SizeGuideline, sizeText, TOOL_DESCRIPTION, ultracodeSystemPrompt } from "./prompt.ts";
+import { type SizeGuideline, sizeText, TOOL_DESCRIPTION, ultracodeSystemPrompt, workflowBasics } from "./prompt.ts";
 import { normalizeArgs, sanitizeContext } from "./args.ts";
-import { KEYWORD_RE, rainbow, spinner, UltracodeEditor } from "./rainbow.ts";
+import { rainbow, spinner, UltracodeEditor } from "./rainbow.ts";
 import { deleteRun, listRuns, patchRun, type RunRecord, readRun, runIdsFromSession, runState } from "./registry.ts";
 import { type AgentState, parseScript, runsRoot, safeStringify, withMeta, WorkflowRun } from "./runtime.ts";
 
 interface Config {
-	/** Start every session with ultracode on. */
-	ultracode?: boolean;
-	/** Let the `ultracode` keyword opt a prompt into a workflow. Default true. */
-	keywordTrigger?: boolean;
 	sizeGuideline?: SizeGuideline;
 	maxConcurrentAgents?: number;
 	maxStructuredRetries?: number;
-	/** Replace the input editor with one that rainbow-highlights the keyword. Default true. */
+	/** Replace the input editor to show the on-mode badge. Default true. */
 	rainbowEditor?: boolean;
 	/** Thinking level for workflow agents. Default: the session's current level. */
 	agentThinking?: string;
@@ -147,7 +141,7 @@ function runLine(run: WorkflowRun): string {
 	];
 	if (c.running) parts.push(`${c.running} running`);
 	if (c.failed) parts.push(`${c.failed} failed`);
-	parts.push(`↑${fmtTokens(run.usage.input)} ↓${fmtTokens(run.usage.output)}`);
+	parts.push(`↑${fmtTokens(run.usage.input)} ↓${fmtTokens(run.usage.output)} · $${run.usage.cost.toFixed(4)}`);
 	return parts.join(" · ");
 }
 
@@ -208,7 +202,6 @@ export default function ultracode(pi: ExtensionAPI) {
 	let ctxRef: ExtensionContext | undefined;
 	let modeOn = false;
 	let previousThinking: string | undefined;
-	let turnIsUltracode = false;
 	let editor: UltracodeEditor | undefined;
 	let frame = 0;
 	/** This session's runs that this process isn't executing: interrupted, or owned by another pi process. */
@@ -248,7 +241,7 @@ export default function ultracode(pi: ExtensionAPI) {
 	const registeredSaved = new Set<string>();
 
 	const size = (): SizeGuideline => config.sizeGuideline ?? "medium";
-	const animating = () => modeOn || turnIsUltracode || runs.some((r) => r.running);
+	const animating = () => modeOn || runs.some((r) => r.running);
 
 	// ── animation / status ──
 
@@ -257,7 +250,7 @@ export default function ultracode(pi: ExtensionAPI) {
 		if (!ctx || ctx.mode !== "tui") return;
 		const theme = ctx.ui.theme;
 		ctx.ui.setStatus("ultracode", modeOn ? rainbow("⚡ultracode", frame, { bold: true }) : undefined);
-		if (turnIsUltracode || modeOn) ctx.ui.setWorkingMessage(rainbow("Ultracoding…", frame));
+		if (modeOn) ctx.ui.setWorkingMessage(rainbow("Ultracoding…", frame));
 
 		const active = runs.filter((r) => r.running);
 		if (!active.length && !detached.length) {
@@ -273,7 +266,7 @@ export default function ultracode(pi: ExtensionAPI) {
 				c.running ? `${c.running} running` : undefined,
 				c.failed ? theme.fg("error", `${c.failed} failed`) : undefined,
 				fmtDuration(Date.now() - r.startedAt),
-				`↑${fmtTokens(r.usage.input)} ↓${fmtTokens(r.usage.output)}`,
+				`↑${fmtTokens(r.usage.input)} ↓${fmtTokens(r.usage.output)} · $${r.usage.cost.toFixed(2)}`,
 			].filter(Boolean);
 			return `${icon} ${rainbow(r.meta.name, frame)} ${theme.fg("muted", `· ${bits.join(" · ")}`)}`;
 		});
@@ -311,16 +304,18 @@ export default function ultracode(pi: ExtensionAPI) {
 
 	/** `restoredPrevious`: the pre-ultracode thinking level saved in the session, when restoring on resume. */
 	function setMode(on: boolean, ctx: ExtensionContext, persist = true, restoredPrevious?: string): void {
-		if (on === modeOn) return;
-		modeOn = on;
-		if (on) {
-			previousThinking = restoredPrevious ?? pi.getThinkingLevel();
-			pi.setThinkingLevel("xhigh");
-		} else {
-			pi.setThinkingLevel((previousThinking as any) ?? "high");
-			ctx.ui.setWorkingMessage();
+		if (on !== modeOn) {
+			modeOn = on;
+			if (on) {
+				previousThinking = restoredPrevious ?? pi.getThinkingLevel();
+				pi.setThinkingLevel("xhigh");
+			} else {
+				if (previousThinking !== undefined) pi.setThinkingLevel(previousThinking as any);
+				previousThinking = undefined;
+				ctx.ui.setWorkingMessage();
+			}
 		}
-		// Save the level to go back to, so turning ultracode off after a resume restores it too.
+		// Persist the command even if already off, without changing the current thinking level.
 		if (persist) pi.appendEntry(MODE_ENTRY, on ? { on, previousThinking } : { on });
 		editor?.setBadge(on);
 		ctxRef = ctx;
@@ -385,9 +380,9 @@ export default function ultracode(pi: ExtensionAPI) {
 		name: "workflow",
 		label: "Workflow",
 		description: TOOL_DESCRIPTION,
-		promptSnippet: "workflow: run a JS orchestration script that fans work out to many background subagents (dynamic workflows / ultracode)",
+		promptSnippet: "workflow: run a JS orchestration script with subagents when a workflow is requested or ultracode mode is on",
 		promptGuidelines: [
-			"Use the workflow tool when the user asks for a workflow or says ultracode, or when a task needs many agents (audits, migrations, cross-checked research). Its result arrives later as a follow-up message; never poll or relaunch it.",
+			"Use workflows when explicitly requested, or for substantive tasks in ultracode mode. Otherwise handle tasks normally. A background result arrives as a follow-up message; do not poll or relaunch it.",
 		],
 		parameters: Type.Object({
 			script: Type.Optional(Type.String({ description: "Full workflow script source, starting with `export const meta = {...}`." })),
@@ -469,7 +464,7 @@ export default function ultracode(pi: ExtensionAPI) {
 		const c = run.counts();
 		const lines = [
 			`${run.id} (${run.meta.name}) — ${run.status}${run.currentPhase ? ` · phase: ${run.currentPhase}` : ""}`,
-			`agents: ${c.done} done, ${c.running} running, ${c.failed} failed, ${c.total} started · ${fmtDuration((run.endedAt ?? Date.now()) - run.startedAt)} · ↑${fmtTokens(run.usage.input)} ↓${fmtTokens(run.usage.output)}`,
+			`agents: ${c.done} done, ${c.running} running, ${c.failed} failed, ${c.total} started · ${fmtDuration((run.endedAt ?? Date.now()) - run.startedAt)} · ↑${fmtTokens(run.usage.input)} ↓${fmtTokens(run.usage.output)} · $${run.usage.cost.toFixed(4)}`,
 			`script: ${run.scriptPath}`,
 		];
 		if (run.agents.length) lines.push("", "Agents:", ...run.agents.slice(-60).map((a) => `  #${a.index} ${agentLine(a)}${a.error ? ` — ${a.error.slice(0, 200)}` : ""}`));
@@ -481,7 +476,7 @@ export default function ultracode(pi: ExtensionAPI) {
 	function describeRecord(r: RunRecord, state: string): string {
 		const lines = [
 			`${r.id} (${r.name}) — ${state === "interrupted" ? "INTERRUPTED (not running; resume with workflow { resume })" : state === "elsewhere" ? `running in another pi process (pid ${r.pid})` : r.status}`,
-			`agents: ${r.done}/${r.total} finished · started ${new Date(r.startedAt).toISOString()}`,
+			`agents: ${r.done}/${r.total} finished · started ${new Date(r.startedAt).toISOString()} · ↑${fmtTokens(r.usage.input)} ↓${fmtTokens(r.usage.output)} · $${r.usage.cost.toFixed(4)}`,
 			`script: ${path.join(runsRoot(), r.id, "script.js")}`,
 		];
 		const resultFile = path.join(runsRoot(), r.id, "result.json");
@@ -525,7 +520,7 @@ export default function ultracode(pi: ExtensionAPI) {
 						"",
 						`This session's runs not executing here (${detached.length}):`,
 						...(detached.length
-							? detached.map((d) => `  ${d.state === "elsewhere" ? `● in pi pid ${d.run.pid}` : "⚠ interrupted"} · ${d.run.name} · ${d.run.done}/${d.run.total} agents · ${d.run.id}`)
+							? detached.map((d) => `  ${d.state === "elsewhere" ? `● in pi pid ${d.run.pid}` : "⚠ interrupted"} · ${d.run.name} · ${d.run.done}/${d.run.total} agents · $${d.run.usage.cost.toFixed(4)} · ${d.run.id}`)
 							: ["  (none)"]),
 					);
 					const known = new Set([...mine.map((r) => r.id), ...detached.map((d) => d.run.id)]);
@@ -611,8 +606,6 @@ export default function ultracode(pi: ExtensionAPI) {
 
 	// ── commands ──
 
-	pi.registerFlag("ultracode", { type: "boolean", description: "Start with ultracode on (xhigh thinking + automatic workflows)" });
-
 	pi.registerCommand("ultracode", {
 		description: "Toggle ultracode: xhigh thinking + automatic dynamic workflows (on|off|status)",
 		getArgumentCompletions: (prefix) =>
@@ -622,6 +615,10 @@ export default function ultracode(pi: ExtensionAPI) {
 			const a = arg.trim().toLowerCase();
 			if (a === "status") {
 				ctx.ui.notify(`ultracode is ${modeOn ? "on" : "off"} · ${sizeText(size())}`, "info");
+				return;
+			}
+			if (a && a !== "on" && a !== "off") {
+				ctx.ui.notify("Usage: /ultracode [on|off|status]", "error");
 				return;
 			}
 			const next = a === "on" ? true : a === "off" ? false : !modeOn;
@@ -841,10 +838,10 @@ export default function ultracode(pi: ExtensionAPI) {
 	pi.on("session_start", (event, ctx) => {
 		ctxRef = ctx;
 		config = loadConfig();
-		if (ctx.mode === "tui" && config.rainbowEditor !== false && config.keywordTrigger !== false) {
+		if (ctx.mode === "tui" && config.rainbowEditor !== false) {
 			ctx.ui.setEditorComponent((tui, theme, kb) => {
 				editor = new UltracodeEditor(tui, theme, kb);
-				if (modeOn) editor.setBadge(true);
+				editor.setBadge(modeOn);
 				return editor;
 			});
 		}
@@ -858,11 +855,12 @@ export default function ultracode(pi: ExtensionAPI) {
 				}
 			}
 		}
-		const want = restored ?? (!!pi.getFlag("ultracode") || !!config.ultracode);
+		const want = restored ?? false;
 		// The new session brings its own thinking level; don't carry the old session's over.
 		modeOn = false;
 		previousThinking = undefined;
 		if (want) setMode(true, ctx, false, restored ? restoredPrevious : undefined);
+		else editor?.setBadge(false);
 		refreshDetached(ctx);
 		const interrupted = detached.filter((d) => d.state === "interrupted").length;
 		if (interrupted && ctx.hasUI) {
@@ -872,47 +870,35 @@ export default function ultracode(pi: ExtensionAPI) {
 		refreshUI();
 	});
 
-	pi.on("input", (event) => {
-		const dismissed = editor?.submittedDismissed ?? false;
-		if (editor) editor.submittedDismissed = false;
-		if (config.keywordTrigger === false || dismissed) return { action: "continue" };
-		// Only prompts a person typed: not extension-injected text or relayed content.
-		if (event.source === "extension" || event.text.trimStart().startsWith("/")) return { action: "continue" };
-		if (!KEYWORD_RE.test(event.text)) return { action: "continue" };
-		turnIsUltracode = true;
-		syncTicker();
-		// Keep the user's message untouched; guidance belongs in the system prompt.
-		return { action: "continue" };
-	});
-
 	pi.on("before_agent_start", (event, ctx) => {
 		ctxRef = ctx;
 		refreshDetached(ctx);
 		const extra: string[] = [];
 		if (modeOn) extra.push(ultracodeSystemPrompt(size()));
-		else if (turnIsUltracode) extra.push(keywordGuidance(size()));
-		const saved = [...discoverSaved(ctx.cwd).values()];
-		if (saved.length) {
-			extra.push(
-				`\n# Saved workflows\nRun with the workflow tool ({ name, args }):\n${saved
-					.map((w) => `- ${w.name}${w.description ? `: ${w.description}` : ""}`)
-					.join("\n")}`,
-			);
-		}
-		const interrupted = detached.filter((d) => d.state === "interrupted");
-		if (interrupted.length) {
-			extra.push(
-				`\n# Interrupted workflow runs\nThese runs from this session are NOT running: the pi process that ran them exited before they finished, so no result will arrive. To continue one, call the workflow tool with { resume: "<id>" } (finished agents are reused, the rest run again).\n${interrupted
-					.map((d) => `- ${d.run.id} (${d.run.name}): ${d.run.done}/${d.run.total} agents finished`)
-					.join("\n")}`,
-			);
+		else extra.push(workflowBasics);
+		if (modeOn) {
+			const saved = [...discoverSaved(ctx.cwd).values()];
+			if (saved.length) {
+				extra.push(
+					`\n# Saved workflows\nRun with the workflow tool ({ name, args }):\n${saved
+						.map((w) => `- ${w.name}${w.description ? `: ${w.description}` : ""}`)
+						.join("\n")}`,
+				);
+			}
+			const interrupted = detached.filter((d) => d.state === "interrupted");
+			if (interrupted.length) {
+				extra.push(
+					`\n# Interrupted workflow runs\nThese runs are not running. The workflow tool can resume them on request ({ resume: "<id>" }).\n${interrupted
+						.map((d) => `- ${d.run.id} (${d.run.name}): ${d.run.done}/${d.run.total} agents finished`)
+						.join("\n")}`,
+				);
+			}
 		}
 		if (extra.length) event.systemPromptOptions.appendSystemPrompt = `${event.systemPromptOptions.appendSystemPrompt ?? ""}\n${extra.join("\n")}`;
 		return undefined;
 	});
 
 	pi.on("agent_end", (_event, ctx) => {
-		turnIsUltracode = false;
 		if (ctx.mode === "tui") ctx.ui.setWorkingMessage();
 		syncTicker();
 	});

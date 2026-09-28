@@ -4,12 +4,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { emptyUsage, type SpawnOptions, type SpawnResult } from "../extensions/ultracode/agent.ts";
 import { parseScript, runsRoot, withMeta, WorkflowRun } from "../extensions/ultracode/runtime.ts";
-import { keywordGuidance, ultracodeSystemPrompt } from "../extensions/ultracode/prompt.ts";
+import { TOOL_DESCRIPTION, ultracodeSystemPrompt, workflowBasics } from "../extensions/ultracode/prompt.ts";
+import { readRunUsage } from "../extensions/ultracode/usage.ts";
 
 process.env.PI_CODING_AGENT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "ultracode-test-"));
 
-assert.doesNotMatch(keywordGuidance("medium"), /\[ultracode\]/);
-assert.match(keywordGuidance("medium"), /explicitly asks not to launch one/);
+assert.match(workflowBasics, /otherwise handle the task normally/);
+assert.doesNotMatch(workflowBasics, /automatic|every substantive|keyword/i);
+assert.match(TOOL_DESCRIPTION, /while \/ultracode mode is on/);
+assert.doesNotMatch(TOOL_DESCRIPTION, /says ["']?ultracode/);
 assert.match(ultracodeSystemPrompt("medium"), /explicitly asks not to launch one/);
 
 let calls = 0;
@@ -163,6 +166,167 @@ assert.equal(s.status, "stopped");
 	assert.equal(out[1].content[1].arguments.script_path, "x.js");
 	assert.equal(messages[1].content[1], call, "original messages not mutated");
 	assert.equal(sanitizeContext([{ role: "assistant", content: [{ type: "toolCall", arguments: { a: [1] } }] }]), undefined);
+}
+
+// Persisted accounting: all agents/attempts/branches and Pi usage categories, not
+// duplicated JSON events, cached journal entries or copied fork history.
+{
+	const entry = (id: string, cost: number, type = "assistant") => type === "assistant"
+		? { type: "message", id, message: { role: "assistant", usage: { input: 10, output: 2, cacheRead: 3, cacheWrite: 4, cost: { total: cost } } } }
+		: type === "tool" ? { type: "message", id, message: { role: "toolResult", usage: { input: 1, cost: { total: cost } }, details: { usage: { cost: { total: 999 } } } } }
+		: { type, id, usage: { output: 1, cost: { total: cost } } };
+	const save = (file: string, entries: any[], parentSession?: string) => {
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, [JSON.stringify({ type: "session", version: 3, id: file, parentSession }), ...entries.map(JSON.stringify), "{partial"].join("\n"));
+	};
+	const base = path.join(runsRoot(), "billing-abc123");
+	const original = path.join(base, "agents/0/attempt-0/original.jsonl");
+	const fork = path.join(base, "agents/0/attempt-0/fork.jsonl");
+	save(original, [entry("a", 1), entry("b", 2), entry("t", 0.5, "tool"), entry("u", 0.25, "usage"), entry("c", 0.125, "compaction"), entry("s", 0.0625, "branch_summary"), { type: "custom", id: "meta", usage: { cost: { total: 999 } } }]);
+	save(fork, [entry("a", 1), entry("f", 3)], original);
+	save(path.join(base, "agents/0/attempt-1/retry.jsonl"), [entry("retry", 4)]);
+	save(path.join(base, "agents/1/session.jsonl"), [entry("a", 5)]); // same entry id in an unrelated file
+	assert.equal(readRunUsage(base).usage.cost, 15.9375);
+	assert.equal(readRunUsage(base).agents.get(0)?.cost, 10.9375);
+	const resumed = path.join(runsRoot(), "billing-resumed-abc123");
+	fs.mkdirSync(resumed, { recursive: true });
+	fs.writeFileSync(path.join(resumed, "run.json"), JSON.stringify({ resumedFrom: "billing-abc123" }));
+	save(path.join(resumed, "agents/0/session.jsonl"), [entry("new", 6)]);
+	save(path.join(resumed, "agents/1/fork.jsonl"), [entry("a", 5), entry("extra", 1)], path.join(base, "agents/1/session.jsonl"));
+	assert.equal(readRunUsage(resumed).usage.cost, 22.9375);
+	assert.equal(readRunUsage(resumed).agents.get(0)?.cost, 6, "per-agent detail is current-run only");
+	// Registry recovery reads the same sessions even without a result.json.
+	fs.writeFileSync(path.join(base, "script.js"), "return 1");
+	const { readRun } = await import("../extensions/ultracode/registry.ts");
+	assert.equal(readRun("billing-abc123")?.usage.cost, 15.9375);
+}
+
+// A running child is visible before completion; its persisted messages replace (not
+// augment) streaming estimates. Retries keep their first child session on disk.
+{
+	let complete!: (value: SpawnResult) => void;
+	let first = true;
+	const agentRunner = async (o: SpawnOptions): Promise<SpawnResult> => {
+		fs.mkdirSync(o.sessionDir, { recursive: true });
+		const file = path.join(o.sessionDir, "child.jsonl");
+		fs.writeFileSync(file, JSON.stringify({ type: "session", version: 3, id: file }) + "\n" + JSON.stringify({ type: "message", id: "turn", message: { role: "assistant", usage: { input: 12, output: 3, cost: { total: first ? 2 : 7 } } } }) + "\n");
+		o.onUsage?.({ ...emptyUsage(), input: 12, output: 3, cost: 100, turns: 1 });
+		if (first) {
+			first = false;
+			return { text: "", usage: { ...emptyUsage(), cost: 100 }, exitCode: 1, aborted: false };
+		}
+		return new Promise((resolve) => { complete = resolve; });
+	};
+	const liveSrc = "return await agent('RETRY')";
+	const live = new WorkflowRun(liveSrc, parseScript(liveSrc), undefined, { ...defaults, runAgent: agentRunner });
+	const done = live.start();
+	for (let i = 0; !complete && i < 100; i++) await new Promise((r) => setTimeout(r, 5));
+	assert.ok(complete);
+	live.refreshUsage(true);
+	assert.equal(live.usage.cost, 9, "live accounting uses both persisted attempts, not streaming events");
+	assert.equal(live.agents[0]?.usage.cost, 9);
+	complete({ text: "ok", usage: { ...emptyUsage(), cost: 100 }, exitCode: 0, aborted: false });
+	await done;
+	assert.equal(live.usage.cost, 9);
+	const { readRun } = await import("../extensions/ultracode/registry.ts");
+	assert.equal(readRun(live.id)?.usage.cost, 9);
+	assert.equal(JSON.parse(fs.readFileSync(path.join(live.runDir, "result.json"), "utf8")).usage.cost, 9);
+	const replay = await run(liveSrc, undefined, live.id);
+	assert.equal(replay.agents[0]?.status, "cached");
+	assert.equal(replay.usage.cost, 9, "replay charges original sessions only once");
+}
+
+// A missing attempt number must not cause a later retry to reuse an existing directory.
+{
+	const source = "return await agent('SPARSE')";
+	let attempt = 0;
+	const sparse = new WorkflowRun(source, parseScript(source), undefined, {
+		...defaults,
+		runAgent: async (o) => {
+			assert.equal(path.basename(o.sessionDir), `attempt-${attempt === 0 ? 3 : 4}`);
+			attempt++;
+			return { text: "ok", usage: emptyUsage(), exitCode: attempt === 1 ? 1 : 0, aborted: false };
+		},
+	});
+	const agentDir = path.join(sparse.runDir, "agents/0");
+	fs.mkdirSync(path.join(agentDir, "attempt-0"), { recursive: true });
+	fs.mkdirSync(path.join(agentDir, "attempt-2"), { recursive: true });
+	await sparse.start();
+	assert.equal(sparse.status, "done", sparse.error);
+	assert.equal(attempt, 2);
+}
+
+// Command-only activation: ordinary text never changes mode or the system prompt.
+{
+	const handlers = new Map<string, (...args: any[]) => any>();
+	const commands = new Map<string, any>();
+	const entries: any[] = [];
+	const levels: string[] = [];
+	let thinking = "medium";
+	let branch: any[] = [];
+	const pi: any = {
+		on: (name: string, fn: (...args: any[]) => any) => handlers.set(name, fn),
+		registerTool: () => {},
+		registerMessageRenderer: () => {},
+		registerCommand: (name: string, command: any) => commands.set(name, command),
+		appendEntry: (type: string, data: any) => entries.push({ type, data }),
+		getThinkingLevel: () => thinking,
+		setThinkingLevel: (level: string) => { thinking = level; levels.push(level); },
+		getFlag: () => true, // legacy flag must no longer enable mode
+	};
+	const ctx: any = {
+		mode: "json", cwd: process.cwd(), hasUI: false,
+		sessionManager: { getSessionId: () => "test-session", getBranch: () => branch },
+		ui: { notify: () => {}, setWorkingMessage: () => {} },
+	};
+	const { default: extension } = await import("../extensions/ultracode/index.ts");
+	const depth = process.env.PI_ULTRACODE_DEPTH;
+	delete process.env.PI_ULTRACODE_DEPTH;
+	try { extension(pi); } finally {
+		if (depth !== undefined) process.env.PI_ULTRACODE_DEPTH = depth;
+	}
+	assert.equal(handlers.has("input"), false, "no keyword input trigger");
+	assert.equal(commands.has("ultracode"), true);
+	const start = (reason: string) => handlers.get("session_start")!({ reason }, ctx);
+	const prompt = () => {
+		const event = { systemPromptOptions: { appendSystemPrompt: "" } };
+		handlers.get("before_agent_start")!(event, ctx);
+		return event.systemPromptOptions.appendSystemPrompt;
+	};
+	const cmd = async (arg: string) => commands.get("ultracode").handler(arg, ctx);
+	start("new");
+	assert.equal(prompt().trim(), workflowBasics, "off appends only neutral workflow basics");
+	assert.doesNotMatch(prompt(), /# Ultracode mode/);
+	assert.equal(thinking, "medium");
+	await cmd("off");
+	assert.deepEqual(levels, [], "off while already off does not touch thinking");
+	assert.equal(entries.at(-1)?.data.on, false);
+	assert.equal(prompt().trim(), workflowBasics);
+	await cmd("");
+	assert.equal(thinking, "xhigh");
+	assert.match(prompt(), /# Ultracode mode \(on\)/);
+	assert.deepEqual(entries.at(-1)?.data, { on: true, previousThinking: "medium" });
+	const priorEntries = entries.length;
+	await cmd("status");
+	assert.equal(entries.length, priorEntries, "status does not change the mode");
+	await cmd("");
+	assert.equal(thinking, "medium", "bare command toggles off");
+	await cmd("on");
+	assert.equal(thinking, "xhigh");
+	await cmd("off");
+	assert.equal(thinking, "medium");
+	assert.equal(prompt().trim(), workflowBasics);
+	await cmd("on");
+	branch = [{ type: "custom", customType: "ultracode-mode", data: entries.at(-1)?.data }];
+	thinking = "medium";
+	start("resume");
+	assert.equal(thinking, "xhigh");
+	await cmd("off");
+	assert.equal(thinking, "medium", "resume restores the saved pre-mode level");
+	branch.push({ type: "custom", customType: "ultracode-mode", data: { on: false } });
+	start("reload");
+	assert.equal(thinking, "medium");
+	assert.equal(prompt().trim(), workflowBasics);
 }
 
 console.log("ok");
