@@ -19,6 +19,10 @@ export const MAX_ITEMS_PER_CALL = 4096;
 export type AgentStatus = "queued" | "running" | "done" | "cached" | "failed" | "stopped";
 /** "interrupted": stopped because pi exited; resumable, and shown as such when the session is resumed. */
 export type RunStatus = "running" | "paused" | "done" | "failed" | "stopped" | "interrupted";
+export type RunTransition =
+	| { type: "phase_end" | "phase_start"; index: number }
+	| { type: "member_start" | "member_settle"; index: number }
+	| { type: "pause" | "resume" | "stop" | "completion" };
 
 export interface AgentOptions {
 	label?: string;
@@ -249,6 +253,7 @@ export class WorkflowRun {
 	private readonly replay = new Map<string, JournalEntry[]>();
 	private readonly journalPath: string;
 	private listeners = new Set<() => void>();
+	private transitionListeners = new Set<(event: RunTransition) => void>();
 	private promise?: Promise<void>;
 
 	readonly source: string;
@@ -296,6 +301,18 @@ export class WorkflowRun {
 		return () => this.listeners.delete(fn);
 	}
 
+	/** Discrete lifecycle events only; activity and streaming usage remain UI-only. */
+	onTransition(fn: (event: RunTransition) => void): () => void {
+		this.transitionListeners.add(fn);
+		return () => this.transitionListeners.delete(fn);
+	}
+
+	private transition(event: RunTransition): void {
+		for (const fn of this.transitionListeners) {
+			try { fn(event); } catch {}
+		}
+	}
+
 	private lastStateWrite = 0;
 	readonly resumedFrom?: string;
 
@@ -341,6 +358,7 @@ export class WorkflowRun {
 		if (this.status !== "running") return;
 		this.gate.paused = true;
 		this.status = "paused";
+		this.transition({ type: "pause" });
 		this.writeState();
 		this.changed();
 	}
@@ -349,6 +367,7 @@ export class WorkflowRun {
 		if (this.status !== "paused") return;
 		this.gate.paused = false;
 		this.status = "running";
+		this.transition({ type: "resume" });
 		this.writeState();
 		this.gate.wake();
 		this.changed();
@@ -357,6 +376,7 @@ export class WorkflowRun {
 	stop(reason: "user" | "shutdown" = "user"): void {
 		if (this.endedAt) return;
 		this.status = reason === "shutdown" ? "interrupted" : "stopped";
+		this.transition({ type: "stop" });
 		this.writeState();
 		this.controller.abort();
 		this.changed();
@@ -398,8 +418,10 @@ export class WorkflowRun {
 
 	private phase(title: unknown): void {
 		const t = String(title);
+		if (this.currentPhase !== undefined) this.transition({ type: "phase_end", index: this.phases.indexOf(this.currentPhase) });
 		this.currentPhase = t;
 		if (!this.phases.includes(t)) this.phases.push(t);
+		this.transition({ type: "phase_start", index: this.phases.indexOf(t) });
 		this.changed();
 	}
 
@@ -434,6 +456,8 @@ export class WorkflowRun {
 			// Journal usage belongs to the original run, not this replay.
 			state.usage = emptyUsage();
 			this.appendJournal(cached);
+			state.startedAt = state.endedAt = Date.now();
+			this.transition({ type: "member_settle", index: state.index });
 			this.changed();
 			return cached.result;
 		}
@@ -442,6 +466,8 @@ export class WorkflowRun {
 			await this.gate.acquire(AbortSignal.any([this.controller.signal, state.controller.signal]));
 		} catch {
 			state.status = "stopped";
+			state.endedAt = Date.now();
+			this.transition({ type: "member_settle", index: state.index });
 			this.changed();
 			return null;
 		}
@@ -464,6 +490,7 @@ export class WorkflowRun {
 				state.endedAt = undefined;
 				state.usage = emptyUsage();
 				state.activity = [];
+				this.transition({ type: "member_start", index: state.index });
 				this.changed();
 
 				const outcome = await this.attempt(state);
@@ -475,12 +502,14 @@ export class WorkflowRun {
 				state.endedAt = Date.now();
 				if (outcome.kind === "stopped") {
 					state.status = "stopped";
+					this.transition({ type: "member_settle", index: state.index });
 					this.changed();
 					return null;
 				}
 				if (outcome.kind === "error") {
 					state.status = "failed";
 					state.error = outcome.error;
+					this.transition({ type: "member_settle", index: state.index });
 					this.changed();
 					if (outcome.throws) throw new Error(`agent "${state.label}": ${outcome.error}`);
 					return null;
@@ -488,6 +517,7 @@ export class WorkflowRun {
 				state.status = "done";
 				state.result = outcome.value;
 				this.appendJournal({ key, result: outcome.value, usage: state.usage });
+				this.transition({ type: "member_settle", index: state.index });
 				this.changed();
 				return outcome.value;
 			}
@@ -634,6 +664,8 @@ export class WorkflowRun {
 		} finally {
 			this.endedAt = Date.now();
 			this.refreshUsage(true);
+			if (this.currentPhase !== undefined) this.transition({ type: "phase_end", index: this.phases.indexOf(this.currentPhase) });
+			this.transition({ type: "completion" });
 			fs.writeFileSync(path.join(this.runDir, "result.json"), safeStringify(this.summary(true), 2));
 			this.writeState();
 			this.changed();

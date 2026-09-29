@@ -21,6 +21,7 @@ import { normalizeArgs, sanitizeContext } from "./args.ts";
 import { rainbow, spinner, UltracodeEditor } from "./rainbow.ts";
 import { deleteRun, listRuns, patchRun, type RunRecord, readRun, runIdsFromSession, runState } from "./registry.ts";
 import { type AgentState, parseScript, runsRoot, safeStringify, withMeta, WorkflowRun } from "./runtime.ts";
+import { observeProgress } from "./progress.ts";
 
 interface Config {
 	sizeGuideline?: SizeGuideline;
@@ -201,6 +202,11 @@ export default function ultracode(pi: ExtensionAPI) {
 	let config = loadConfig();
 	const runs: WorkflowRun[] = [];
 	let ctxRef: ExtensionContext | undefined;
+	let sessionReady = true;
+	const activeSessionId = () => {
+		if (!sessionReady) return undefined;
+		try { return ctxRef?.sessionManager.getSessionId(); } catch { return undefined; }
+	};
 	let modeOn = false;
 	let previousThinking: string | undefined;
 	let editor: UltracodeEditor | undefined;
@@ -351,9 +357,16 @@ export default function ultracode(pi: ExtensionAPI) {
 		opts: { resume?: string; background: boolean },
 	): { run: WorkflowRun; done: Promise<void> } {
 		const parsed = parseScript(source);
-		const run = new WorkflowRun(source, parsed, args, defaults(ctx), opts.resume);
+		const initialDefaults = defaults(ctx);
+		const runSessionId = initialDefaults.sessionId;
+		const run = new WorkflowRun(source, parsed, args, initialDefaults, opts.resume);
 		runs.push(run);
 		ctxRef = ctx;
+		if (runSessionId) {
+			const progress = observeProgress(pi, run, runSessionId, activeSessionId);
+			run.onTransition(progress);
+			progress({ type: "launch" });
+		}
 		run.onChange(() => {
 			if (!ticker) refreshUI();
 		});
@@ -843,8 +856,11 @@ export default function ultracode(pi: ExtensionAPI) {
 		return messages ? { messages } : undefined;
 	});
 
+	pi.on("session_before_switch", () => { sessionReady = false; });
+	pi.on("session_before_fork", () => { sessionReady = false; });
 	pi.on("session_start", (event, ctx) => {
 		ctxRef = ctx;
+		sessionReady = true;
 		config = loadConfig();
 		if (ctx.mode === "tui" && config.rainbowEditor !== false) {
 			ctx.ui.setEditorComponent((tui, theme, kb) => {
@@ -912,6 +928,7 @@ export default function ultracode(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
+		// Record interruption only while the initiating session is still active.
 		// Quitting pi interrupts running workflows; they show up as resumable when the session is resumed.
 		for (const r of runs) if (r.running) r.stop("shutdown");
 		if (ticker) clearInterval(ticker);
